@@ -6,6 +6,9 @@ build/
 dist/
 .venv/
 .pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
 
 # generated artifacts during examples / tests
 *.vvp

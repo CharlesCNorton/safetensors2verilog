@@ -505,6 +505,206 @@ def test_register_d_input_validation():
         emit_module(g)
 
 
+def test_register_with_sync_reset():
+    g = GateGraph(
+        inputs=[Signal("d", width=4)],
+        outputs=[Signal("q", width=4)],
+        gates=[Gate(name="q", kind="register", inputs=["d"],
+                    attrs={"clk": "clk", "rst": "rst",
+                           "reset_kind": "sync", "init": 0},
+                    output_width=4)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "always @(posedge clk) begin" in text
+    assert "if (rst) q <= 4'd0;" in text
+
+
+def test_register_with_async_low_reset():
+    g = GateGraph(
+        inputs=[Signal("d", width=4)],
+        outputs=[Signal("q", width=4)],
+        gates=[Gate(name="q", kind="register", inputs=["d"],
+                    attrs={"clk": "clk", "rst": "rst_n",
+                           "reset_polarity": "low", "init": 0},
+                    output_width=4)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "always @(posedge clk or negedge rst_n)" in text
+    assert "if (!rst_n)" in text
+
+
+def test_register_with_enable():
+    g = GateGraph(
+        inputs=[Signal("d", width=4), Signal("en", width=1)],
+        outputs=[Signal("q", width=4)],
+        gates=[Gate(name="q", kind="register", inputs=["d", "en"],
+                    attrs={"clk": "clk"}, output_width=4)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "q <= en ? d : q;" in text
+
+
+def test_tristate_kind():
+    g = GateGraph(
+        inputs=[Signal("d", width=8), Signal("en", width=1)],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="tristate", inputs=["d", "en"],
+                    output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "8'bz" in text
+    assert "en ? d :" in text
+
+
+def test_inout_signal_emits_inout_port():
+    g = GateGraph(
+        inputs=[Signal("io_data", width=8, direction="inout"),
+                Signal("en", width=1)],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="add",
+                    inputs=["io_data", "io_data"], output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "inout wire [7:0] io_data" in text
+
+
+def test_parameter_kind_emits_localparam():
+    g = GateGraph(
+        inputs=[Signal("x", width=8)],
+        outputs=[Signal("y", width=8)],
+        gates=[
+            Gate(name="MAGIC", kind="parameter",
+                 attrs={"value": 42}, output_width=8),
+            Gate(name="y", kind="add", inputs=["x", "MAGIC"], output_width=8),
+        ],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "localparam" in text
+    assert "MAGIC" in text
+
+
+def test_module_parameter_emits_in_hash_paren():
+    """Signal with is_parameter=True becomes `module foo #(parameter ...)`."""
+    g = GateGraph(
+        inputs=[
+            Signal("WIDTH", width=8, is_parameter=True, parameter_value=8),
+            Signal("x", width=8),
+        ],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="add", inputs=["x", "x"], output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "module t #(" in text
+    assert "parameter [7:0] WIDTH" in text
+
+
+def test_dsp_attribute_on_mul():
+    g = GateGraph(
+        inputs=[Signal("a", width=8, signed=True),
+                Signal("b", width=8, signed=True)],
+        outputs=[Signal("p", width=16, signed=True)],
+        gates=[Gate(name="p", kind="mul", inputs=["a", "b"],
+                    attrs={"use_dsp": True},
+                    output_width=16, output_signed=True)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert '(* use_dsp = "yes" *)' in text
+
+
+def test_mux_case_form_for_many_inputs():
+    """A mux with > 4 data inputs emits a case statement."""
+    inputs_list = [Signal("sel", width=3)] + [
+        Signal(f"d{i}", width=4) for i in range(6)
+    ]
+    g = GateGraph(
+        inputs=inputs_list,
+        outputs=[Signal("y", width=4)],
+        gates=[Gate(name="y", kind="mux",
+                    inputs=["sel"] + [f"d{i}" for i in range(6)],
+                    output_width=4)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "case (sel)" in text
+    assert "endcase" in text
+    # The output must be declared as reg (always @(*) drives it)
+    assert "output reg [3:0] y" in text
+
+
+def test_systemverilog_target_uses_logic_keyword():
+    g = GateGraph(
+        inputs=[Signal("d", width=4)],
+        outputs=[Signal("q", width=4)],
+        gates=[Gate(name="q", kind="register", inputs=["d"],
+                    attrs={"clk": "clk"}, output_width=4)],
+        top="t",
+    )
+    text = emit_module(g, target="sv")
+    assert "logic" in text
+    assert "always_ff @(posedge clk)" in text
+    assert "wire" not in text or "wire " not in text  # crude check
+
+
+def test_unknown_target_rejected():
+    g = GateGraph(inputs=[], outputs=[], gates=[], top="t")
+    with pytest.raises(ValueError, match="unknown target"):
+        emit_module(g, target="vhdl")
+
+
+def test_collect_clocks_finds_distinct_clocks():
+    """collect_clocks returns the set of clk attrs across register gates."""
+    from safetensors2verilog import collect_clocks, collect_resets
+    g = GateGraph(
+        inputs=[Signal("d1"), Signal("d2"),
+                Signal("clk_fast"), Signal("clk_slow"),
+                Signal("rst_a"), Signal("rst_b")],
+        outputs=[Signal("q1"), Signal("q2")],
+        gates=[
+            Gate(name="q1", kind="register", inputs=["d1"],
+                 attrs={"clk": "clk_fast", "rst": "rst_a"}),
+            Gate(name="q2", kind="register", inputs=["d2"],
+                 attrs={"clk": "clk_slow", "rst": "rst_b"}),
+        ],
+        top="t",
+    )
+    assert collect_clocks(g) == {"clk_fast", "clk_slow"}
+    assert collect_resets(g) == {"rst_a", "rst_b"}
+
+
+def test_emit_top_wrapper_links_core_and_bram():
+    """The wrapper helper instantiates the carved-out core and a BRAM."""
+    from safetensors2verilog import emit_top_wrapper
+    text = emit_top_wrapper(
+        core_module="threshold_cpu",
+        bram_module="threshold_bram",
+        addr_bits=10,
+        data_bits=8,
+        wrapper_name="cpu_with_bram",
+    )
+    assert "module cpu_with_bram" in text
+    assert "threshold_cpu core" in text
+    assert "threshold_bram bram" in text
+    assert "[9:0] addr" in text
+    assert "[7:0] data_in" in text
+    assert ".clk(clk)" in text
+    assert ".we(we)" in text
+
+
+def test_emit_top_wrapper_validates_names():
+    from safetensors2verilog import emit_top_wrapper
+    with pytest.raises(ValueError):
+        emit_top_wrapper(core_module="123_bad", bram_module="ok",
+                         wrapper_name="ok2")
+
+
 # ---- Constant edge cases ----------------------------------------------------
 
 

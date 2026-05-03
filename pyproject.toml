@@ -64,6 +64,7 @@ include = ["safetensors2verilog*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--cov=safetensors2verilog --cov-fail-under=75 --cov-report=term-missing"
 
 [tool.ruff]
 line-length = 100

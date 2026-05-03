@@ -118,6 +118,16 @@ python -m safetensors2verilog input.safetensors --dry-run
 
 # Suppress progress messages on stderr
 python -m safetensors2verilog input.safetensors -o out.v --quiet
+
+# Emit SystemVerilog (logic, always_ff, always_comb) instead of Verilog
+python -m safetensors2verilog input.safetensors -o out.sv --target sv
+
+# Drop a Synopsys Design Constraints starter alongside the Verilog
+python -m safetensors2verilog input.safetensors -o out.v \
+    --emit-sdc out.sdc --sdc-period-ns 8.0   # 125 MHz target
+
+# Diagnostics as line-delimited JSON instead of plain text
+python -m safetensors2verilog input.safetensors -o out.v --diag-format json
 ```
 
 ## Worked examples

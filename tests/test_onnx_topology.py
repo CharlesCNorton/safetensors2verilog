@@ -173,6 +173,143 @@ def test_onnx_topology_requires_onnx_path():
             registry.get("onnx_topology")().parse(st_path)
 
 
+def test_onnx_topology_multi_input_graph():
+    """A graph with two non-initializer inputs becomes two banks of ports."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        a = helper.make_tensor_value_info("a", TensorProto.FLOAT, [1, 3])
+        b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [1, 3])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3])
+        node = helper.make_node("Add", ["a", "b"], ["y"], "add1")
+        graph = helper.make_graph([node], "g", [a, b], [y], [])
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+
+        result = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=4
+        )
+        # 2 inputs * 3 elements = 6 input ports
+        in_names = sorted(s.name for s in result.inputs)
+        assert len(in_names) == 6
+        # And the names are prefixed since multi-input
+        assert any(n.startswith("a_") for n in in_names)
+        assert any(n.startswith("b_") for n in in_names)
+
+
+def test_onnx_topology_scalar_broadcasting():
+    """Add with one operand being a scalar (length 1) broadcasts."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+        scalar = numpy_helper.from_array(
+            torch.tensor([3], dtype=torch.float32).numpy(), name="bias"
+        )
+        node = helper.make_node("Add", ["x", "bias"], ["y"], "broadcast_add")
+        graph = helper.make_graph([node], "g", [x], [y], [scalar])
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+
+        result = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=4
+        )
+        # 4 add gates (one per output element), each adding x[i] + bias_const
+        adds = [g for g in result.gates if g.kind == "add"]
+        assert len(adds) == 4
+
+
+def test_onnx_topology_concat_split():
+    """Concat then Split round-trips the signal list."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        a = helper.make_tensor_value_info("a", TensorProto.FLOAT, [1, 2])
+        b = helper.make_tensor_value_info("b", TensorProto.FLOAT, [1, 2])
+        out0 = helper.make_tensor_value_info("out0", TensorProto.FLOAT, [1, 2])
+        out1 = helper.make_tensor_value_info("out1", TensorProto.FLOAT, [1, 2])
+        nodes = [
+            helper.make_node("Concat", ["a", "b"], ["cc"], "c", axis=1),
+            helper.make_node(
+                "Split", ["cc"], ["out0", "out1"], "s",
+                axis=1, split=[2, 2],
+            ),
+        ]
+        graph = helper.make_graph(
+            nodes, "g", [a, b], [out0, out1], []
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+
+        result = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=4
+        )
+        # Two ONNX outputs, each carrying 2 elements: 4 IR output signals.
+        assert len(result.outputs) == 4
+
+
+def test_onnx_topology_gather():
+    """Gather with initializer indices produces a permutation."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 3])
+        idx = numpy_helper.from_array(
+            torch.tensor([3, 0, 2], dtype=torch.int64).numpy(), name="idx"
+        )
+        node = helper.make_node("Gather", ["x", "idx"], ["y"], "g", axis=1)
+        graph = helper.make_graph([node], "g", [x], [y], [idx])
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+
+        result = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=4
+        )
+        assert len(result.outputs) == 3
+
+
+def test_onnx_topology_unsupported_op_lists_alternatives():
+    """The error message should list supported ops and known deferred ops."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+        node = helper.make_node("Sigmoid", ["x"], ["y"], "sig")
+        graph = helper.make_graph([node], "g", [x], [y], [])
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+        with pytest.raises(NotImplementedError) as exc:
+            registry.get("onnx_topology")().parse(sp, onnx=str(op))
+        msg = str(exc.value)
+        assert "Sigmoid" in msg
+        assert "Supported:" in msg
+        assert "Gemm" in msg
+        assert "Conv" in msg  # mentioned as deferred
+
+
 def _have_iverilog() -> bool:
     return shutil.which("iverilog") is not None and shutil.which("vvp") is not None
 

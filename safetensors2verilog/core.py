@@ -35,13 +35,20 @@ from typing import Any
 class Signal:
     """An external port of the design.
 
-    name:    free-form symbolic name; the backend sanitises for Verilog
-    width:   bit width (1 = single bit, >1 = bus)
-    signed:  if True, declared 'signed' and arithmetic uses $signed
+    name:        free-form symbolic name; the backend sanitises for Verilog
+    width:       bit width (1 = single bit, >1 = bus)
+    signed:      if True, declared 'signed' and arithmetic uses $signed
+    direction:   "in", "out", or "inout"; "inout" enables tristate emission
+    is_parameter: if True, declared as a Verilog parameter rather than wire/reg
+                  (used for compile-time constants exposed at the module port)
+    parameter_value: integer default for parameter ports
     """
     name: str
     width: int = 1
     signed: bool = False
+    direction: str = "auto"
+    is_parameter: bool = False
+    parameter_value: int = 0
 
 
 @dataclass
@@ -166,3 +173,49 @@ class _Registry:
 
 
 registry = _Registry()
+
+
+# ---- Metadata-namespace enforcement ---------------------------------------
+
+
+# Reserved metadata keys that the safetensors2verilog tool itself uses,
+# regardless of frontend. Frontends must not write to these.
+_RESERVED_METADATA_KEYS = frozenset({"format", "encoding", "version"})
+
+
+def validate_metadata_namespace(
+    frontend: type[Frontend], metadata: dict[str, Any]
+) -> None:
+    """Check that every metadata key either lives under the frontend's
+    namespace, is a reserved global key, or is a special shared key
+    (currently: ``signal_registry``, used by both threshold_logic and
+    any future frontend that wants symbolic-name lookup).
+
+    Frontends are encouraged to use only keys with the prefix
+    ``"<metadata_namespace>."``; everything else triggers a warning.
+    Set ``metadata_namespace`` via the @registry.register decorator.
+    """
+    import warnings
+
+    ns = frontend.metadata_namespace
+    shared = {"signal_registry"}
+    for key in metadata:
+        if key in _RESERVED_METADATA_KEYS or key in shared:
+            continue
+        if not ns:
+            warnings.warn(
+                f"frontend '{frontend.name}' has no metadata_namespace and "
+                f"is reading metadata key {key!r}; collisions with other "
+                f"frontends are possible.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        if not (key == ns or key.startswith(ns + ".")):
+            warnings.warn(
+                f"frontend '{frontend.name}' (namespace '{ns}') is reading "
+                f"metadata key {key!r} that lives outside its namespace; "
+                f"prefer keys named '{ns}.<sub>'.",
+                UserWarning,
+                stacklevel=2,
+            )

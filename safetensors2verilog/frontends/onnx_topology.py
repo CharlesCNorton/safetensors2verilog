@@ -157,19 +157,13 @@ class OnnxTopologyFrontend(Frontend):
         if not graph_inputs:
             raise ValueError("ONNX graph has no non-initializer inputs")
 
-        # For now require exactly one input tensor with shape [N] or [1, N].
-        if len(graph_inputs) != 1:
-            raise NotImplementedError(
-                f"onnx_topology supports a single graph input; "
-                f"got {len(graph_inputs)}: {[n for n, _ in graph_inputs]}"
-            )
-        in_name, in_shape = graph_inputs[0]
-        if not in_shape or len(in_shape) > 2:
-            raise NotImplementedError(
-                f"input '{in_name}' has shape {in_shape}; "
-                f"only 1-D or 2-D-with-batch=1 supported"
-            )
-        in_size = in_shape[-1]
+        # Each non-initializer input becomes its own bank of ports.
+        for in_name, in_shape in graph_inputs:
+            if not in_shape or len(in_shape) > 2:
+                raise NotImplementedError(
+                    f"input '{in_name}' has shape {in_shape}; "
+                    f"only 1-D or 2-D-with-batch=1 supported"
+                )
 
         # ---- IR construction ----
         gates: list[Gate] = []
@@ -180,14 +174,28 @@ class OnnxTopologyFrontend(Frontend):
         val_widths: dict[str, int] = {}
         val_signed: dict[str, bool] = {}
 
-        # External inputs
-        external = [
-            Signal(name=f"x{i}", width=activation_bits, signed=True)
-            for i in range(in_size)
-        ]
-        val_signals[in_name] = [s.name for s in external]
-        val_widths[in_name] = activation_bits
-        val_signed[in_name] = True
+        # External inputs: one bank of signed activation_bits ports per
+        # graph input. Single-input models keep the legacy `x0..xN-1`
+        # naming; multi-input models prefix with the input name to keep
+        # ports unambiguous.
+        external: list[Signal] = []
+        single_input = len(graph_inputs) == 1
+        for in_name, in_shape in graph_inputs:
+            in_size = in_shape[-1]
+            if single_input:
+                names = [f"x{i}" for i in range(in_size)]
+            else:
+                safe = "".join(
+                    c if c.isalnum() else "_" for c in in_name
+                ).lower()
+                names = [f"{safe}_{i}" for i in range(in_size)]
+            for n in names:
+                external.append(
+                    Signal(name=n, width=activation_bits, signed=True)
+                )
+            val_signals[in_name] = names
+            val_widths[in_name] = activation_bits
+            val_signed[in_name] = True
 
         accumulator_width = activation_bits
 
@@ -291,13 +299,21 @@ class OnnxTopologyFrontend(Frontend):
                     if ix not in val_signals:
                         _bind_constant(ix, initializers[ix])
 
-                a_sigs = val_signals[ins[0]]
-                b_sigs = val_signals[ins[1]]
+                a_sigs = list(val_signals[ins[0]])
+                b_sigs = list(val_signals[ins[1]])
+                # Scalar-vector broadcasting: a length-1 operand replicates
+                # to match the length of the other.
                 if len(a_sigs) != len(b_sigs):
-                    raise NotImplementedError(
-                        f"{op} node '{node.name}': broadcasting "
-                        f"({len(a_sigs)} vs {len(b_sigs)}) not supported"
-                    )
+                    if len(a_sigs) == 1:
+                        a_sigs = a_sigs * len(b_sigs)
+                    elif len(b_sigs) == 1:
+                        b_sigs = b_sigs * len(a_sigs)
+                    else:
+                        raise NotImplementedError(
+                            f"{op} node '{node.name}': vector-vector "
+                            f"broadcasting ({len(a_sigs)} vs {len(b_sigs)}) "
+                            f"not supported; only scalar-vector"
+                        )
                 width = max(val_widths[ins[0]], val_widths[ins[1]]) + 1
                 kind = {"Add": "add", "Sub": "sub", "Mul": "mul"}[op]
                 if op == "Mul":
@@ -316,6 +332,113 @@ class OnnxTopologyFrontend(Frontend):
                 val_signals[outs[0]] = out_sigs
                 val_widths[outs[0]] = width
                 val_signed[outs[0]] = True
+
+            elif op == "Reshape":
+                # Our IR is bit-level / 1-D, so Reshape between 1-D shapes
+                # of equal element count is a no-op alias.
+                src = ins[0]
+                # ONNX Reshape's second input is the shape (an initializer
+                # we ignore beyond confirming the element count).
+                if src not in val_signals:
+                    raise ValueError(
+                        f"Reshape node '{node.name}': input '{src}' has no signals"
+                    )
+                val_signals[outs[0]] = list(val_signals[src])
+                val_widths[outs[0]] = val_widths[src]
+                val_signed[outs[0]] = val_signed[src]
+
+            elif op == "Concat":
+                # Concatenate signal lists in input order.
+                concat_sigs: list[str] = []
+                widths_seen = set()
+                signed_seen = set()
+                for ix in ins:
+                    if ix not in val_signals:
+                        if ix in initializers:
+                            _bind_constant(ix, initializers[ix])
+                        else:
+                            raise ValueError(
+                                f"Concat node '{node.name}': input '{ix}' unresolved"
+                            )
+                    concat_sigs.extend(val_signals[ix])
+                    widths_seen.add(val_widths[ix])
+                    signed_seen.add(val_signed[ix])
+                if len(widths_seen) > 1 or len(signed_seen) > 1:
+                    raise NotImplementedError(
+                        f"Concat node '{node.name}': inputs differ in element "
+                        f"width or sign; not supported"
+                    )
+                val_signals[outs[0]] = concat_sigs
+                val_widths[outs[0]] = next(iter(widths_seen))
+                val_signed[outs[0]] = next(iter(signed_seen))
+
+            elif op == "Split":
+                # ONNX Split divides input into N equal (or `split` attr)
+                # parts along an axis. For our 1-D case, divide the signal
+                # list among len(outs) outputs.
+                src = ins[0]
+                if src not in val_signals:
+                    raise ValueError(
+                        f"Split node '{node.name}': input '{src}' unresolved"
+                    )
+                src_sigs = val_signals[src]
+                attrs = {a.name: a for a in node.attribute}
+                if "split" in attrs:
+                    sizes = list(attrs["split"].ints)
+                elif len(ins) > 1 and ins[1] in initializers:
+                    sizes = [int(v) for v in initializers[ins[1]].flatten().tolist()]
+                else:
+                    if len(src_sigs) % len(outs) != 0:
+                        raise NotImplementedError(
+                            f"Split node '{node.name}': uneven split "
+                            f"({len(src_sigs)} into {len(outs)}) without "
+                            f"explicit sizes"
+                        )
+                    chunk = len(src_sigs) // len(outs)
+                    sizes = [chunk] * len(outs)
+                if sum(sizes) != len(src_sigs):
+                    raise ValueError(
+                        f"Split node '{node.name}': sizes sum {sum(sizes)} "
+                        f"!= source length {len(src_sigs)}"
+                    )
+                offset = 0
+                for out_name, size in zip(outs, sizes):
+                    val_signals[out_name] = src_sigs[offset:offset + size]
+                    val_widths[out_name] = val_widths[src]
+                    val_signed[out_name] = val_signed[src]
+                    offset += size
+
+            elif op == "Gather":
+                # data[indices]; we support 1-D data and integer indices
+                # supplied as an initializer.
+                data_name, idx_name = ins[0], ins[1]
+                if data_name not in val_signals:
+                    raise ValueError(
+                        f"Gather node '{node.name}': data '{data_name}' "
+                        f"unresolved"
+                    )
+                if idx_name not in initializers:
+                    raise NotImplementedError(
+                        f"Gather node '{node.name}': dynamic indices "
+                        f"(non-initializer) not supported"
+                    )
+                indices = [
+                    int(v) for v in initializers[idx_name].flatten().tolist()
+                ]
+                src_sigs = val_signals[data_name]
+                gathered = []
+                for k in indices:
+                    if k < 0:
+                        k += len(src_sigs)
+                    if not 0 <= k < len(src_sigs):
+                        raise ValueError(
+                            f"Gather node '{node.name}': index {k} out of "
+                            f"range for length {len(src_sigs)}"
+                        )
+                    gathered.append(src_sigs[k])
+                val_signals[outs[0]] = gathered
+                val_widths[outs[0]] = val_widths[data_name]
+                val_signed[outs[0]] = val_signed[data_name]
 
             elif op == "Relu":
                 in_sigs = val_signals[ins[0]]
@@ -351,9 +474,23 @@ class OnnxTopologyFrontend(Frontend):
                 _bind_constant(outs[0], torch.from_numpy(arr.copy()))
 
             else:
+                supported = (
+                    "Gemm, MatMul, Add, Sub, Mul, Relu, Identity, Constant, "
+                    "Reshape, Concat, Split, Gather"
+                )
+                deferred = (
+                    "Conv, ConvTranspose (need 2-D windowed access), "
+                    "LayerNorm, GroupNorm, BatchNorm (need fixed-point "
+                    "sqrt/divide), Softmax, Sigmoid, Tanh, Exp (need "
+                    "fixed-point transcendentals), Attention (composite "
+                    "of softmax + matmul)"
+                )
                 raise NotImplementedError(
                     f"ONNX op '{op}' (node '{node.name}') not supported by "
-                    f"the onnx_topology frontend yet"
+                    f"the onnx_topology frontend.\n  Supported: {supported}.\n"
+                    f"  Deferred: {deferred}.\n"
+                    f"  Add a custom kind via @lowering(...) and a node "
+                    f"branch here to extend coverage."
                 )
 
         # ---- Resolve graph outputs ----

@@ -282,7 +282,14 @@ def _lower_sub(ctx, g): return _arith2("-", ctx, g)
 
 
 @lowering("mul")
-def _lower_mul(ctx, g): return _arith2("*", ctx, g)
+def _lower_mul(ctx, g):
+    """Multibit multiply. Set attrs={'use_dsp': True} to emit a synthesis
+    pragma directing Vivado / Quartus to place the operation in a DSP block.
+    """
+    lines = _arith2("*", ctx, g)
+    if g.attrs.get("use_dsp"):
+        lines.insert(0, '  (* use_dsp = "yes" *)')
+    return lines
 
 
 def _bitwise(op: str, ctx: EmitContext, g: Gate) -> list[str]:
@@ -379,7 +386,10 @@ def _lower_slice(ctx: EmitContext, g: Gate) -> list[str]:
 def _lower_mux(ctx: EmitContext, g: Gate) -> list[str]:
     """inputs[0]=sel, inputs[1..N]=data choices indexed by sel.
 
-    All data inputs must match output_width.
+    All data inputs must match output_width. For more than 4 data
+    cases the lowering emits a `case` statement rather than a chained
+    ternary; vendor synthesis tends to recognise the case form more
+    cleanly as a hardware mux.
     """
     if len(g.inputs) < 3:
         raise ValueError(
@@ -399,10 +409,22 @@ def _lower_mux(ctx: EmitContext, g: Gate) -> list[str]:
             f"  assign {ctx.name(g.name)} = {sel} ? "
             f"{ctx.name(data[1])} : {ctx.name(data[0])};"
         ]
-    expr = ctx.name(data[-1])
-    for i in range(len(data) - 2, -1, -1):
-        expr = f"({sel} == {i}) ? {ctx.name(data[i])} : ({expr})"
-    return [f"  assign {ctx.name(g.name)} = {expr};"]
+    if len(data) <= 4:
+        # chained ternary: small enough to read as a single line
+        expr = ctx.name(data[-1])
+        for i in range(len(data) - 2, -1, -1):
+            expr = f"({sel} == {i}) ? {ctx.name(data[i])} : ({expr})"
+        return [f"  assign {ctx.name(g.name)} = {expr};"]
+    # case form for larger muxes
+    out = ctx.name(g.name)
+    lines = ["  always @(*) begin"]
+    lines.append(f"    case ({sel})")
+    for i, d in enumerate(data):
+        lines.append(f"      {i}: {out} = {ctx.name(d)};")
+    lines.append(f"      default: {out} = {ctx.name(data[-1])};")
+    lines.append("    endcase")
+    lines.append("  end")
+    return lines
 
 
 @lowering("eq")
@@ -448,24 +470,106 @@ def _lower_clamp(ctx: EmitContext, g: Gate) -> list[str]:
 
 @lowering("register")
 def _lower_register(ctx: EmitContext, g: Gate) -> list[str]:
-    """Synchronous flip-flop. inputs=[d]. attrs: clk='clk', rst (optional), init=0."""
-    if len(g.inputs) != 1:
-        raise ValueError(f"gate '{g.name}' kind 'register' expects 1 input")
+    """Synchronous flip-flop.
+
+    inputs : [d]  (or [d, en] when an enable signal is supplied)
+
+    attrs:
+      clk             clock signal name (default "clk")
+      rst             reset signal name (optional)
+      init            integer reset value (default 0)
+      reset_polarity  "high" (default) or "low"
+      reset_kind      "async" (default) or "sync"
+      enable          enable signal name (optional); takes precedence
+                      over the second `inputs` element when both supplied
+    """
+    if len(g.inputs) not in (1, 2):
+        raise ValueError(
+            f"gate '{g.name}' kind 'register' expects 1 or 2 inputs"
+        )
     d = ctx.name(g.inputs[0])
+    en_signal = g.attrs.get("enable")
+    if en_signal is None and len(g.inputs) == 2:
+        en_signal = g.inputs[1]
     clk = g.attrs.get("clk", "clk")
     rst = g.attrs.get("rst")
     init = int(g.attrs.get("init", 0))
+    polarity = g.attrs.get("reset_polarity", "high")
+    kind = g.attrs.get("reset_kind", "async")
+    if polarity not in ("high", "low"):
+        raise ValueError(
+            f"gate '{g.name}' register: reset_polarity must be 'high' or 'low'"
+        )
+    if kind not in ("async", "sync"):
+        raise ValueError(
+            f"gate '{g.name}' register: reset_kind must be 'async' or 'sync'"
+        )
+
     name = ctx.name(g.name)
     width = max(1, g.output_width)
     init_lit = f"{width}'d{init & ((1 << width) - 1)}"
+
+    rst_test = f"{rst}" if polarity == "high" else f"!{rst}"
+    rst_edge = f"posedge {rst}" if polarity == "high" else f"negedge {rst}"
+
+    body_assign = (
+        f"{name} <= {en_signal} ? {d} : {name};"
+        if en_signal else f"{name} <= {d};"
+    )
+
     if rst:
+        if kind == "async":
+            return [
+                f"  always @(posedge {clk} or {rst_edge}) begin",
+                f"    if ({rst_test}) {name} <= {init_lit};",
+                f"    else {body_assign}",
+                "  end",
+            ]
         return [
-            f"  always @(posedge {clk} or posedge {rst}) begin",
-            f"    if ({rst}) {name} <= {init_lit};",
-            f"    else {name} <= {d};",
+            f"  always @(posedge {clk}) begin",
+            f"    if ({rst_test}) {name} <= {init_lit};",
+            f"    else {body_assign}",
             "  end",
         ]
-    return [f"  always @(posedge {clk}) {name} <= {d};"]
+    return [f"  always @(posedge {clk}) {body_assign}"]
+
+
+@lowering("tristate")
+def _lower_tristate(ctx: EmitContext, g: Gate) -> list[str]:
+    """3-state buffer: y = en ? data : 'bz.
+
+    inputs : [data, en]
+    attrs:
+      enable_high   if True (default), drive data when en==1; else when en==0
+    """
+    if len(g.inputs) != 2:
+        raise ValueError(
+            f"gate '{g.name}' kind 'tristate' expects [data, en]"
+        )
+    data = ctx.name(g.inputs[0])
+    en = ctx.name(g.inputs[1])
+    enable_high = bool(g.attrs.get("enable_high", True))
+    width = max(1, g.output_width)
+    z_lit = f"{width}'bz" if width > 1 else "1'bz"
+    if enable_high:
+        return [f"  assign {ctx.name(g.name)} = {en} ? {data} : {z_lit};"]
+    return [f"  assign {ctx.name(g.name)} = {en} ? {z_lit} : {data};"]
+
+
+@lowering("parameter")
+def _lower_parameter(ctx: EmitContext, g: Gate) -> list[str]:
+    """Compile-time constant emitted as a Verilog `localparam` declaration.
+
+    attrs: value:int. Width is taken from output_width.
+    """
+    value = int(g.attrs["value"])
+    width = max(1, g.output_width)
+    sign_letter = "s" if g.output_signed else ""
+    mask = (1 << width) - 1
+    return [
+        f"  localparam [{width-1}:0] {ctx.name(g.name)} = "
+        f"{width}'{sign_letter}d{value & mask};"
+    ]
 
 
 @lowering("rom")
@@ -515,14 +619,55 @@ def _lower_rom(ctx: EmitContext, g: Gate) -> list[str]:
 # ---- Top-level emit ---------------------------------------------------------
 
 
-def emit_module(graph: GateGraph) -> str:
+def _gate_needs_reg(g: Gate) -> bool:
+    """Gates whose lowering emits an `always` block need a `reg` declaration."""
+    if g.kind == "register":
+        return True
+    if g.kind == "mux":
+        # The mux lowering switches to case-form for >4 data inputs (>5 total)
+        return len(g.inputs) > 5
+    return False
+
+
+def emit_module(graph: GateGraph, target: str = "verilog") -> str:
     """Emit the full Verilog text for a GateGraph.
+
+    target:
+      "verilog" (default) — Verilog-2001 / 2005 with `wire`/`reg`/`always`
+      "sv" or "systemverilog" — SystemVerilog with `logic`,
+        `always_comb`, `always_ff`. Same logical output, friendlier
+        for SV-aware simulators and synthesis tools.
 
     Gates must be topologically sorted: every input of every gate must
     be either a constant sentinel ("#0", "#1"), an external input, or
     the output of an earlier gate. Module name and signal names are
     sanitized; collisions are resolved by appending '_u<N>'.
     """
+    if target in ("sv", "systemverilog"):
+        text = _emit_module_internal(graph)
+        return _sv_translate(text)
+    if target != "verilog":
+        raise ValueError(
+            f"unknown target '{target}'; valid: 'verilog', 'sv'"
+        )
+    return _emit_module_internal(graph)
+
+
+def _sv_translate(verilog_text: str) -> str:
+    """Rewrite Verilog-2001 emit to SystemVerilog idioms."""
+    out = verilog_text
+    # logic for wires and regs (declarations only, not bit-vector indexing)
+    out = re.sub(r"\bwire signed", "logic signed", out)
+    out = re.sub(r"\bwire ", "logic ", out)
+    out = re.sub(r"\breg signed", "logic signed", out)
+    out = re.sub(r"\breg ", "logic ", out)
+    # always blocks
+    out = re.sub(r"\balways @\(\*\)", "always_comb", out)
+    out = re.sub(r"\balways @\(posedge", "always_ff @(posedge", out)
+    return out
+
+
+def _emit_module_internal(graph: GateGraph) -> str:
     _validate_module_name(graph.top)
 
     used: set[str] = set()
@@ -552,8 +697,12 @@ def emit_module(graph: GateGraph) -> str:
     # build counters and accumulators (output -> +1 -> register -> output)
     # without the topo sort rejecting the feedback as a cycle.
     register_outputs = {g.name for g in graph.gates if g.kind == "register"}
+    parameter_outputs = {g.name for g in graph.gates if g.kind == "parameter"}
     declared: set[str] = (
-        {s.name for s in graph.inputs} | {"#0", "#1"} | register_outputs
+        {s.name for s in graph.inputs}
+        | {"#0", "#1"}
+        | register_outputs
+        | parameter_outputs
     )
 
     all_signals = (
@@ -608,19 +757,51 @@ def emit_module(graph: GateGraph) -> str:
     if has_reset and "rst" not in explicit_input_names:
         port_decls.append("  input wire rst")
 
+    # Module parameter declarations come before the port list as #(...).
+    parameter_signals = [s for s in graph.inputs if s.is_parameter]
+    if parameter_signals:
+        param_decls = []
+        for s in parameter_signals:
+            sign_letter = "s" if s.signed else ""
+            width = max(1, s.width)
+            param_decls.append(
+                f"  parameter [{width-1}:0] {sigmap[s.name]} = "
+                f"{width}'{sign_letter}d{s.parameter_value & ((1 << width) - 1)}"
+            )
+        lines.append(f"module {graph.top} #(")
+        lines.append(",\n".join(param_decls))
+        lines.append(") (")
+    else:
+        lines.append(f"module {graph.top} (")
+
     for s in graph.inputs:
-        port_decls.append(
-            _signal_decl("input", "wire", sigmap[s.name],
-                         max(1, s.width), s.signed)
-        )
+        if s.is_parameter:
+            continue
+        if s.direction == "inout":
+            port_decls.append(
+                _signal_decl("inout", "wire", sigmap[s.name],
+                             max(1, s.width), s.signed)
+            )
+        else:
+            port_decls.append(
+                _signal_decl("input", "wire", sigmap[s.name],
+                             max(1, s.width), s.signed)
+            )
+    # Track gates whose lowering needs `reg` declarations
+    reg_gates = {g.name for g in graph.gates if _gate_needs_reg(g)}
     for s in graph.outputs:
-        kw = "reg" if s.name in register_outputs else "wire"
+        if s.direction == "inout":
+            port_decls.append(
+                _signal_decl("inout", "wire", sigmap[s.name],
+                             max(1, s.width), s.signed)
+            )
+            continue
+        kw = "reg" if s.name in reg_gates else "wire"
         port_decls.append(
             _signal_decl("output", kw, sigmap[s.name],
                          max(1, s.width), s.signed)
         )
 
-    lines.append(f"module {graph.top} (")
     lines.append(",\n".join(port_decls))
     lines.append(");")
     lines.append("")
@@ -630,7 +811,11 @@ def emit_module(graph: GateGraph) -> str:
     if internals:
         lines.append("  // internal nets")
         for g in internals:
-            kw = "reg" if g.kind == "register" else "wire"
+            if g.kind == "parameter":
+                # parameter gates emit their own `localparam` line in the
+                # gate-evaluation section; skip wire/reg declaration.
+                continue
+            kw = "reg" if g.name in reg_gates else "wire"
             lines.append(
                 _signal_decl(None, kw, sigmap[g.name],
                              max(1, g.output_width), g.output_signed) + ";"
@@ -647,6 +832,89 @@ def emit_module(graph: GateGraph) -> str:
     lines.append("")
 
     return "\n".join(lines)
+
+
+# ---- Multi-clock validation -----------------------------------------------
+
+
+def collect_clocks(graph: GateGraph) -> set[str]:
+    """Return every distinct clock signal used by register gates in `graph`.
+
+    Useful for frontends that want to surface multi-clock-domain warnings
+    or to ensure each clock is in graph.inputs.
+    """
+    return {
+        g.attrs.get("clk", "clk")
+        for g in graph.gates if g.kind == "register"
+    }
+
+
+def collect_resets(graph: GateGraph) -> set[str]:
+    """Return every distinct reset signal used by register gates in `graph`."""
+    out: set[str] = set()
+    for g in graph.gates:
+        if g.kind == "register":
+            rst = g.attrs.get("rst")
+            if rst:
+                out.add(str(rst))
+    return out
+
+
+# ---- Top-level wrapper helper (for memory carve-out) -----------------------
+
+
+def emit_top_wrapper(
+    core_module: str,
+    bram_module: str,
+    addr_bits: int = 16,
+    data_bits: int = 8,
+    wrapper_name: str = "top_wrapper",
+) -> str:
+    """Emit a wrapper module that instantiates the carved-out core and the
+    BRAM template, wiring `addr` / `data_in` / `we` from the core to the
+    BRAM and `data_out` back into the core's promoted memory inputs.
+
+    This pairs with `--skip-memory --emit-bram-template`: the carved-out
+    core is purely combinational and exposes its memory interface as
+    external ports; the wrapper closes the loop by instantiating both
+    modules and a synchronous BRAM that the core drives.
+
+    The user is expected to know which core ports correspond to addr
+    /data_in/we/data_out; the wrapper assumes the names `addr`,
+    `data_in`, `data_out`, and `we`.
+    """
+    _validate_module_name(core_module)
+    _validate_module_name(bram_module)
+    _validate_module_name(wrapper_name)
+    return (
+        f"// Generated by safetensors2verilog. Wrapper around {core_module}\n"
+        f"// and {bram_module}; closes the memory loop carved out by\n"
+        f"// --skip-memory.\n"
+        f"\n"
+        f"`default_nettype none\n"
+        f"\n"
+        f"module {wrapper_name} (\n"
+        f"  input  wire clk,\n"
+        f"  input  wire rst\n"
+        f");\n"
+        f"\n"
+        f"  wire [{addr_bits-1}:0] addr;\n"
+        f"  wire [{data_bits-1}:0] data_in;\n"
+        f"  wire [{data_bits-1}:0] data_out;\n"
+        f"  wire we;\n"
+        f"\n"
+        f"  {core_module} core (\n"
+        f"    .addr(addr), .data_in(data_in), .we(we), .data_out(data_out)\n"
+        f"  );\n"
+        f"\n"
+        f"  {bram_module} bram (\n"
+        f"    .clk(clk), .we(we), .addr(addr), .data_in(data_in),\n"
+        f"    .data_out(data_out)\n"
+        f"  );\n"
+        f"\n"
+        f"endmodule // {wrapper_name}\n"
+        f"`default_nettype wire\n"
+    )
 
 
 # ---- BRAM template (for memory carve-out) -----------------------------------
