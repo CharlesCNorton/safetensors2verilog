@@ -180,7 +180,52 @@ registry = _Registry()
 
 # Reserved metadata keys that the safetensors2verilog tool itself uses,
 # regardless of frontend. Frontends must not write to these.
-_RESERVED_METADATA_KEYS = frozenset({"format", "encoding", "version"})
+_RESERVED_METADATA_KEYS = frozenset({
+    "format", "encoding", "version", "schema_version",
+})
+
+# Schema version for the threshold-logic / signal_registry metadata
+# convention. Frontends that read signal_registry consult this so future
+# format changes can be detected and rejected with a clear message rather
+# than silently misinterpreted.
+#
+#   1   - original layout (8bit-threshold-computer through May 2026)
+#         signal_registry is a JSON object mapping str(int) -> name.
+#         External inputs prefixed "$"; constants "#0" / "#1".
+#         Gate tensors: <gate>.weight (1-D or [N,K] packed),
+#                       <gate>.bias (length-1 or length-N packed),
+#                       <gate>.inputs (1-D int signal IDs).
+SIGNAL_REGISTRY_SCHEMA_VERSIONS_SUPPORTED: tuple[int, ...] = (1,)
+SIGNAL_REGISTRY_SCHEMA_VERSION_LATEST: int = 1
+
+
+def check_schema_version(metadata: dict[str, Any], frontend_name: str) -> int:
+    """Validate ``schema_version`` in safetensors metadata.
+
+    Returns the parsed integer schema version. Files without the key are
+    treated as version 1 for backward compatibility (the value the
+    8bit-threshold-computer family uses today). Files whose declared
+    version is not in :data:`SIGNAL_REGISTRY_SCHEMA_VERSIONS_SUPPORTED`
+    raise :class:`ValueError` so the frontend never silently misreads a
+    future format.
+    """
+    raw = metadata.get("schema_version")
+    if raw is None:
+        return 1
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"frontend '{frontend_name}': metadata schema_version "
+            f"{raw!r} is not an integer"
+        ) from e
+    if version not in SIGNAL_REGISTRY_SCHEMA_VERSIONS_SUPPORTED:
+        raise ValueError(
+            f"frontend '{frontend_name}': unsupported schema_version "
+            f"{version}; supported versions: "
+            f"{list(SIGNAL_REGISTRY_SCHEMA_VERSIONS_SUPPORTED)}"
+        )
+    return version
 
 
 def validate_metadata_namespace(

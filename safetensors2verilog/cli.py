@@ -94,6 +94,128 @@ def _emit_sdc_template(graph: GateGraph, period_ns: float) -> str:
     return "\n".join(lines)
 
 
+def _format_port_contract(graph: GateGraph) -> str:
+    """Render the GateGraph's port surface as a human-readable contract."""
+    lines: list[str] = []
+    lines.append(f"# port contract for {graph.top}")
+    lines.append("")
+    lines.append(f"## inputs ({len(graph.inputs)})")
+    for s in graph.inputs:
+        suffix = ""
+        if s.width != 1:
+            suffix += f" [{s.width-1}:0]"
+        if s.signed:
+            suffix += " signed"
+        if s.is_parameter:
+            suffix += f" parameter (default={s.parameter_value})"
+        lines.append(f"  {s.name}{suffix}")
+    lines.append("")
+    lines.append(f"## outputs ({len(graph.outputs)})")
+    for s in graph.outputs:
+        suffix = f" [{s.width-1}:0]" if s.width != 1 else ""
+        if s.signed:
+            suffix += " signed"
+        lines.append(f"  {s.name}{suffix}")
+    lines.append("")
+    lines.append(f"## gates: {len(graph.gates)}")
+    return "\n".join(lines) + "\n"
+
+
+def _apply_top_outputs_filter(graph: GateGraph, spec: str) -> GateGraph:
+    """Trim ``graph.outputs`` to only the signals matching ``spec``.
+
+    Names in ``spec`` are substring-matched against output port names
+    (after the frontend has computed them). Any output not matching is
+    dropped from the module's port list and becomes an internal wire.
+    Gate definitions and topological order are preserved.
+
+    Raising on an empty match would force the user into a discovery
+    loop; we instead emit a warning and keep all outputs so the
+    accidental typo doesn't silently produce a portless module.
+    """
+    import warnings
+    from .core import Signal
+
+    requested = [t for t in spec.replace(",", " ").split() if t]
+    if not requested:
+        return graph
+
+    import re
+    def _candidates(name: str) -> tuple[str, str]:
+        # Match against the raw signal name and the Verilog-sanitized
+        # form, so users can paste either '.' or '_' separated names.
+        return name, re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+    keep: list[Signal] = []
+    matched: set[str] = set()
+    for s in graph.outputs:
+        cands = _candidates(s.name)
+        if any(req in c for req in requested for c in cands):
+            keep.append(s)
+            matched.add(s.name)
+
+    missed = [
+        r for r in requested
+        if not any(r in c for s in graph.outputs for c in _candidates(s.name))
+    ]
+    if missed:
+        warnings.warn(
+            f"--top-outputs: no output port name contains "
+            f"{missed!r}; ignoring those terms",
+            UserWarning, stacklevel=2,
+        )
+    if not keep:
+        warnings.warn(
+            "--top-outputs: nothing matched; falling back to original outputs",
+            UserWarning, stacklevel=2,
+        )
+        return graph
+
+    return GateGraph(
+        inputs=graph.inputs, outputs=keep, gates=graph.gates, top=graph.top
+    )
+
+
+_METADATA_HEADER_EXCLUDED = frozenset({
+    "signal_registry",         # too large to render in a comment
+    "schema_version",           # internal bookkeeping
+    "format", "encoding", "version",
+})
+
+
+def _render_metadata_header(input_path: Path) -> str:
+    """Read non-reserved metadata from a safetensors file and render it
+    as a `// key: value` Verilog comment block.
+
+    Returns "" when there is nothing to render. Long values are truncated
+    at 200 characters per line so the header remains readable.
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(str(input_path), framework="pt") as f:
+            meta = f.metadata() or {}
+    except Exception:
+        return ""
+
+    keep = [
+        (k, v) for k, v in sorted(meta.items())
+        if k not in _METADATA_HEADER_EXCLUDED
+        and not k.startswith("threshold_logic.signal_registry")
+    ]
+    if not keep:
+        return ""
+
+    lines = ["// ---- safetensors metadata passthrough ----"]
+    for k, v in keep:
+        text = str(v).replace("\n", " ").replace("\r", " ")
+        if len(text) > 200:
+            text = text[:197] + "..."
+        lines.append(f"// {k}: {text}")
+    lines.append("// ---- end metadata ----")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _emit_diagnostic(message: str, level: str, fmt: str, file=sys.stderr) -> None:
     """Emit one diagnostic message in either plain text or JSON form."""
     if fmt == "json":
@@ -186,6 +308,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--inspect", action="store_true",
+        help=(
+            "after parsing (combine with --circuit to scope), print the "
+            "external port contract — every input and output the module "
+            "exposes, with widths and signedness. Use this to discover "
+            "that, e.g., 'float16.add' is the mantissa-add stage and "
+            "takes 15 inputs, not 32. Goes to stdout (or --output)."
+        ),
+    )
+    parser.add_argument(
         "-q", "--quiet", action="store_true",
         help="suppress progress messages on stderr.",
     )
@@ -209,6 +341,124 @@ def main(argv: list[str] | None = None) -> int:
         "--sdc-period-ns", type=float, default=10.0,
         help="default clock period for --emit-sdc in nanoseconds "
              "(default: 10.0, i.e. 100 MHz).",
+    )
+    parser.add_argument(
+        "--pipeline-every", type=int, default=None, metavar="N",
+        help=(
+            "insert a pipeline register every N combinational depths. "
+            "Each cut adds 1 cycle of latency; the critical path shrinks "
+            "to N levels. The user must drive 'clk' from outside. "
+            "Useful when threshold-network depth (try --report) exceeds "
+            "what the target FPGA can close at the desired clock."
+        ),
+    )
+    parser.add_argument(
+        "--group-ports", action="store_true",
+        help=(
+            "in the emitted module's port list, group ports by their "
+            "leading dotted prefix and insert '// -- <prefix> --' "
+            "comment dividers. Same semantics, much shorter visual "
+            "diffs. Recommended whenever the port count exceeds a few "
+            "dozen."
+        ),
+    )
+    parser.add_argument(
+        "--pack-buses", action="store_true",
+        help=(
+            "detect external input ports of the form '<base>[i]' for "
+            "contiguous indices 0..N-1 and emit them as a single packed "
+            "Verilog bus 'input wire [N-1:0] base'. References inside "
+            "the body resolve to bit-selects on the bus. Off by default "
+            "for backward compatibility with downstream tools that "
+            "depend on the flat per-bit port list."
+        ),
+    )
+    parser.add_argument(
+        "--equiv-check", action="store_true",
+        help=(
+            "after writing Verilog, build a self-checking testbench from "
+            "the in-memory GateGraph (Python evaluator), compile it with "
+            "iverilog, and report PASS/FAIL counts. Threshold-logic "
+            "frontend only. Requires iverilog and vvp on PATH and "
+            "--output to be set."
+        ),
+    )
+    parser.add_argument(
+        "--equiv-max-exhaustive", type=int, default=16, metavar="N",
+        help="max external inputs for which --equiv-check uses exhaustive "
+             "enumeration (default: 16). Beyond this, falls back to "
+             "--equiv-sample random cases.",
+    )
+    parser.add_argument(
+        "--equiv-sample", type=int, default=1024, metavar="N",
+        help="number of random samples for --equiv-check on circuits "
+             "wider than --equiv-max-exhaustive (default: 1024).",
+    )
+    parser.add_argument(
+        "--emit-sby-equiv", type=Path, default=None, metavar="PATH",
+        help=(
+            "alongside the main output, write a SymbiYosys equiv task "
+            "script comparing the emitted Verilog against itself; the "
+            "user replaces one of the [files] entries with a reference "
+            "implementation to formally check equivalence."
+        ),
+    )
+    parser.add_argument(
+        "--synth-stats", action="store_true",
+        help=(
+            "after writing Verilog, run yosys+abc on it and print "
+            "post-tech-map gate counts and a LUT4 estimate. Yosys "
+            "must be on PATH (--yosys-path overrides). Requires "
+            "--output to be set."
+        ),
+    )
+    parser.add_argument(
+        "--yosys-path", type=str, default=None, metavar="PATH",
+        help="explicit path to yosys executable for --synth-stats",
+    )
+    parser.add_argument(
+        "--report", choices=["text", "json"], default=None,
+        help=(
+            "after parsing, print a static-analysis report to stderr "
+            "(critical-path depth, fanout, gate-kind histogram). "
+            "Does not affect Verilog emission."
+        ),
+    )
+    parser.add_argument(
+        "--top-outputs", type=str, default=None, metavar="NAMES",
+        help=(
+            "comma- or whitespace-separated list of signal names that "
+            "should remain as top-level module outputs. Every other "
+            "internal gate is demoted to a wire. Substring match: "
+            "'fa7_ha2_sum_layer2,fa7_carry_or' keeps just the eight "
+            "sum bits and the final carry of an 8-bit ripple-carry. "
+            "Without this flag, every signal not consumed by another "
+            "gate is promoted to a top-level output (the default the "
+            "frontend computes)."
+        ),
+    )
+    parser.add_argument(
+        "--metadata-passthrough", action="store_true",
+        help=(
+            "copy non-reserved safetensors metadata into a Verilog "
+            "header comment block at the top of the output file. "
+            "Reserved keys (signal_registry, schema_version, internal "
+            "frontend bookkeeping) are excluded; everything else is "
+            "rendered as // key: value lines. Use this to preserve "
+            "model provenance, training notes, license tags, etc., "
+            "through the compile step."
+        ),
+    )
+    parser.add_argument(
+        "--circuit", action="append", default=None, metavar="PREFIX",
+        help=(
+            "extract a single named circuit (with dependency closure) "
+            "from the input safetensors before compiling. May be passed "
+            "multiple times to extract several circuits at once. PREFIX "
+            "matches a gate whose name equals or is a dotted descendant "
+            "of the prefix (e.g. 'arithmetic.ripplecarry8bit'). "
+            "Threshold-logic frontend only."
+        ),
     )
 
     # Two-pass parsing: pull out the frontend name first, then add its
@@ -274,12 +524,62 @@ def main(argv: list[str] | None = None) -> int:
 
         _warnings.showwarning = _showwarning_json
 
+    # --circuit triggers dependency-closure extraction into a temp file,
+    # which is then handed to the frontend's normal parse() path.
+    parse_path = args.input
+    cleanup_temp: Path | None = None
+    if args.circuit:
+        if args.frontend != "threshold_logic":
+            parser.error(
+                "--circuit is only supported with --frontend threshold_logic"
+            )
+        from .extract import extract_subset
+        import tempfile
+        tmpdir = Path(tempfile.mkdtemp(prefix="s2v_extract_"))
+        cleanup_temp = tmpdir
+        parse_path = tmpdir / "subset.safetensors"
+        try:
+            extract_subset(
+                args.input, list(args.circuit), parse_path,
+                quiet=args.quiet,
+            )
+        except ValueError as e:
+            parser.error(str(e))
+            return 2
+
     frontend = frontend_cls()
-    graph = frontend.parse(args.input, top=args.top, **fe_kwargs)
+    try:
+        graph = frontend.parse(parse_path, top=args.top, **fe_kwargs)
+    finally:
+        if cleanup_temp is not None:
+            import shutil
+            shutil.rmtree(cleanup_temp, ignore_errors=True)
 
     def _info(msg: str) -> None:
         if not args.quiet:
             print(msg, file=sys.stderr)
+
+    if args.top_outputs:
+        graph = _apply_top_outputs_filter(graph, args.top_outputs)
+        _info(
+            f"--top-outputs trimmed module to {len(graph.outputs)} output(s)"
+        )
+
+    if args.pipeline_every is not None and args.pipeline_every > 0:
+        from .transforms import pipeline_every
+        before_gates = len(graph.gates)
+        graph = pipeline_every(graph, args.pipeline_every)
+        _info(
+            f"--pipeline-every {args.pipeline_every}: inserted "
+            f"{len(graph.gates) - before_gates} register(s)"
+        )
+
+    if args.report:
+        from .analysis import format_summary, summary
+        if args.report == "json":
+            print(json.dumps(summary(graph), indent=2), file=sys.stderr)
+        else:
+            print(format_summary(graph), file=sys.stderr)
 
     if args.dry_run:
         _info(
@@ -288,10 +588,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.inspect:
+        report = _format_port_contract(graph)
+        if args.output is None:
+            sys.stdout.write(report)
+        else:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(report, encoding="utf-8")
+            _info(f"wrote {args.output} (port contract)")
+        return 0
+
     if args.emit_ir == "json":
         text = json.dumps(_graph_to_jsonable(graph), indent=2)
     else:
-        text = emit_module(graph, target=args.target)
+        text = emit_module(graph, target=args.target,
+                           pack_buses=args.pack_buses,
+                           group_ports=args.group_ports)
+        if args.metadata_passthrough:
+            header = _render_metadata_header(args.input)
+            if header:
+                text = header + text
 
     if args.output is None:
         sys.stdout.write(text)
@@ -311,6 +627,57 @@ def main(argv: list[str] | None = None) -> int:
             f"wrote {args.emit_sdc} (SDC, "
             f"{args.sdc_period_ns} ns clock period)"
         )
+
+    if args.equiv_check:
+        if args.frontend != "threshold_logic":
+            parser.error(
+                "--equiv-check is only supported with --frontend threshold_logic"
+            )
+            return 2
+        if args.output is None:
+            parser.error("--equiv-check requires --output")
+            return 2
+        from .equivalence import run_iverilog_check
+        try:
+            result = run_iverilog_check(
+                graph, text, dut_module=graph.top,
+                max_exhaustive=args.equiv_max_exhaustive,
+                sample_size=args.equiv_sample,
+                pack_buses=args.pack_buses,
+            )
+        except (RuntimeError, FileNotFoundError) as e:
+            _info(f"--equiv-check failed: {e}")
+        else:
+            verdict = "PASS" if result["passed"] else "FAIL"
+            _info(
+                f"--equiv-check: {verdict} {result['cases']} cases "
+                f"({result['fails']} fail)"
+            )
+
+    if args.emit_sby_equiv is not None:
+        from .equivalence import emit_sby_equiv
+        sby = emit_sby_equiv(
+            reference_v=str(args.output) if args.output else "reference.v",
+            target_v=str(args.output) if args.output else "target.v",
+            top=graph.top,
+        )
+        args.emit_sby_equiv.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_sby_equiv.write_text(sby, encoding="utf-8")
+        _info(f"wrote {args.emit_sby_equiv} (SymbiYosys equiv task)")
+
+    if args.synth_stats:
+        if args.output is None:
+            parser.error("--synth-stats requires --output")
+            return 2
+        from .synth import format_synth_report, run_synth
+        try:
+            stats = run_synth(
+                args.output, top=graph.top, yosys=args.yosys_path,
+            )
+        except (RuntimeError, FileNotFoundError) as e:
+            _info(f"--synth-stats failed: {e}")
+        else:
+            _info(format_synth_report(stats))
 
     if args.emit_bram_template is not None:
         addr_bits = args.bram_addr_bits

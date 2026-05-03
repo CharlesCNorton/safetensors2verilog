@@ -629,7 +629,75 @@ def _gate_needs_reg(g: Gate) -> bool:
     return False
 
 
-def emit_module(graph: GateGraph, target: str = "verilog") -> str:
+_BUS_BIT_RE = re.compile(r"^(?P<base>.+)\[(?P<idx>\d+)\]$")
+
+
+def _detect_buses(
+    signals: list,
+) -> tuple[dict[str, list[tuple[int, str]]], set[str]]:
+    """Group signals of the form 'base[i]' into per-base buses.
+
+    Returns (buses, members) where:
+      buses[base]   -> sorted list of (index, original_name) tuples
+      members       -> set of original signal names that became bus members
+
+    Only buses whose indices form a contiguous range starting at 0 are
+    accepted; partial buses (gaps, non-zero start) fall through to flat
+    emission so a 7-bit subset doesn't pollute the namespace.
+    """
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for s in signals:
+        m = _BUS_BIT_RE.match(s.name)
+        if not m:
+            continue
+        base = m.group("base")
+        idx = int(m.group("idx"))
+        # All bus members must share width / signedness; we conservatively
+        # only group 1-bit ports.
+        if s.width != 1:
+            continue
+        groups.setdefault(base, []).append((idx, s.name))
+
+    buses: dict[str, list[tuple[int, str]]] = {}
+    members: set[str] = set()
+    for base, items in groups.items():
+        items.sort()
+        indices = [i for i, _ in items]
+        if indices == list(range(len(indices))) and len(indices) >= 2:
+            buses[base] = items
+            for _, nm in items:
+                members.add(nm)
+    return buses, members
+
+
+def _group_by_prefix(
+    decls: list[tuple[str, str]], depth: int = 2,
+) -> list[tuple[str, list[str]]]:
+    """Group (signal_name, decl_text) pairs by their leading dotted segments.
+
+    Uses the first ``depth`` dot-separated segments of each name as the
+    group label. Signals with fewer than ``depth`` segments are grouped
+    under their own full name; signals with no dots fall under the empty
+    prefix ''. Order of first-appearance is preserved.
+    """
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    for name, text in decls:
+        parts = name.split(".")
+        if len(parts) <= 1:
+            prefix = ""
+        else:
+            prefix = ".".join(parts[:depth])
+        if prefix not in groups:
+            groups[prefix] = []
+            order.append(prefix)
+        groups[prefix].append(text)
+    return [(p, groups[p]) for p in order]
+
+
+def emit_module(graph: GateGraph, target: str = "verilog",
+                pack_buses: bool = False,
+                group_ports: bool = False) -> str:
     """Emit the full Verilog text for a GateGraph.
 
     target:
@@ -644,13 +712,17 @@ def emit_module(graph: GateGraph, target: str = "verilog") -> str:
     sanitized; collisions are resolved by appending '_u<N>'.
     """
     if target in ("sv", "systemverilog"):
-        text = _emit_module_internal(graph)
+        text = _emit_module_internal(
+            graph, pack_buses=pack_buses, group_ports=group_ports
+        )
         return _sv_translate(text)
     if target != "verilog":
         raise ValueError(
             f"unknown target '{target}'; valid: 'verilog', 'sv'"
         )
-    return _emit_module_internal(graph)
+    return _emit_module_internal(
+        graph, pack_buses=pack_buses, group_ports=group_ports
+    )
 
 
 def _sv_translate(verilog_text: str) -> str:
@@ -667,13 +739,33 @@ def _sv_translate(verilog_text: str) -> str:
     return out
 
 
-def _emit_module_internal(graph: GateGraph) -> str:
+def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
+                          group_ports: bool = False) -> str:
     _validate_module_name(graph.top)
 
     used: set[str] = set()
     sigmap: dict[str, str] = {}
 
+    # Detect bus families before flat-name sanitization so that bus
+    # members (e.g. '$a[0]'..'$a[7]') get mapped to a Verilog bit-select
+    # like 'a[0]' rather than each becoming its own scalar port.
+    input_buses: dict[str, list[tuple[int, str]]] = {}
+    input_bus_members: set[str] = set()
+    if pack_buses:
+        input_buses, input_bus_members = _detect_buses(graph.inputs)
+        for base, items in input_buses.items():
+            # Pick a clean Verilog name for the bus (sanitized, possibly
+            # stripped of the leading `$` that marks external ports).
+            bus_id = _sanitize(
+                base[1:] if base.startswith("$") else base, used
+            )
+            for idx, original_name in items:
+                sigmap[original_name] = f"{bus_id}[{idx}]"
+            sigmap[("__bus__", base)] = bus_id   # type: ignore[index]
+
     for s in graph.inputs:
+        if s.name in sigmap:
+            continue
         sigmap[s.name] = _sanitize(s.name, used)
     for s in graph.outputs:
         if s.name not in sigmap:
@@ -751,11 +843,14 @@ def _emit_module_internal(graph: GateGraph) -> str:
     lines.append("")
 
     port_decls: list[str] = []
+    port_decl_pairs: list[tuple[str, str]] = []   # (name, decl) for grouping
     explicit_input_names = {s.name for s in graph.inputs}
     if has_register and "clk" not in explicit_input_names:
         port_decls.append("  input wire clk")
+        port_decl_pairs.append(("clk", "  input wire clk"))
     if has_reset and "rst" not in explicit_input_names:
         port_decls.append("  input wire rst")
+        port_decl_pairs.append(("rst", "  input wire rst"))
 
     # Module parameter declarations come before the port list as #(...).
     parameter_signals = [s for s in graph.inputs if s.is_parameter]
@@ -774,35 +869,68 @@ def _emit_module_internal(graph: GateGraph) -> str:
     else:
         lines.append(f"module {graph.top} (")
 
+    emitted_bus_bases: set[str] = set()
     for s in graph.inputs:
         if s.is_parameter:
             continue
+        if s.name in input_bus_members:
+            # find which bus this member belongs to
+            m = _BUS_BIT_RE.match(s.name)
+            base = m.group("base") if m else None
+            if base in input_buses and base not in emitted_bus_bases:
+                width = len(input_buses[base])
+                bus_id = sigmap[("__bus__", base)]   # type: ignore[index]
+                decl = _signal_decl("input", "wire", bus_id, width, False)
+                port_decls.append(decl)
+                port_decl_pairs.append((base, decl))
+                emitted_bus_bases.add(base)
+            continue
         if s.direction == "inout":
-            port_decls.append(
-                _signal_decl("inout", "wire", sigmap[s.name],
-                             max(1, s.width), s.signed)
-            )
+            decl = _signal_decl("inout", "wire", sigmap[s.name],
+                                max(1, s.width), s.signed)
         else:
-            port_decls.append(
-                _signal_decl("input", "wire", sigmap[s.name],
-                             max(1, s.width), s.signed)
-            )
+            decl = _signal_decl("input", "wire", sigmap[s.name],
+                                max(1, s.width), s.signed)
+        port_decls.append(decl)
+        port_decl_pairs.append((s.name, decl))
     # Track gates whose lowering needs `reg` declarations
     reg_gates = {g.name for g in graph.gates if _gate_needs_reg(g)}
     for s in graph.outputs:
         if s.direction == "inout":
-            port_decls.append(
-                _signal_decl("inout", "wire", sigmap[s.name],
-                             max(1, s.width), s.signed)
-            )
-            continue
-        kw = "reg" if s.name in reg_gates else "wire"
-        port_decls.append(
-            _signal_decl("output", kw, sigmap[s.name],
-                         max(1, s.width), s.signed)
-        )
+            decl = _signal_decl("inout", "wire", sigmap[s.name],
+                                max(1, s.width), s.signed)
+        else:
+            kw = "reg" if s.name in reg_gates else "wire"
+            decl = _signal_decl("output", kw, sigmap[s.name],
+                                max(1, s.width), s.signed)
+        port_decls.append(decl)
+        port_decl_pairs.append((s.name, decl))
 
-    lines.append(",\n".join(port_decls))
+    if group_ports and len(port_decl_pairs) > 8:
+        groups = _group_by_prefix(port_decl_pairs)
+        rendered: list[str] = []
+        for prefix, decls in groups:
+            if prefix:
+                rendered.append(f"  // -- {prefix} --")
+            rendered.extend(decls)
+        # commas separate ports across the whole list, not group lines
+        out_parts: list[str] = []
+        first = True
+        for line in rendered:
+            if line.startswith("  //"):
+                if not first:
+                    out_parts.append(",")
+                out_parts.append("\n" + line + "\n")
+                first = True
+            else:
+                if not first:
+                    out_parts.append(",\n")
+                out_parts.append(line)
+                first = False
+        # Strip a trailing comma if any (won't happen but be defensive)
+        lines.append("".join(out_parts))
+    else:
+        lines.append(",\n".join(port_decls))
     lines.append(");")
     lines.append("")
 

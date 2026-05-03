@@ -71,10 +71,23 @@ class ThresholdLogicFrontend(Frontend):
             FrontendOption(
                 name="strict",
                 type=bool,
-                default=False,
+                default=True,
                 help=(
                     "error out on stale or missing routing metadata instead of "
-                    "promoting affected inputs to anonymous external ports."
+                    "promoting affected inputs to anonymous external ports. "
+                    "On by default; pass --promote-unresolved to opt in to the "
+                    "permissive behavior (silently fabricates external ports)."
+                ),
+            ),
+            FrontendOption(
+                name="promote-unresolved",
+                type=bool,
+                default=False,
+                help=(
+                    "permissive complement of --strict: promote stale or missing "
+                    "routing references to anonymous external ports rather than "
+                    "raising. Useful for debugging partial extractions; do not "
+                    "use for production compilation."
                 ),
             ),
         ]
@@ -84,16 +97,21 @@ class ThresholdLogicFrontend(Frontend):
         path: Path,
         top: str = "top",
         skip_memory: bool = False,
-        strict: bool = False,
+        strict: bool = True,
+        promote_unresolved: bool = False,
         **options,
     ) -> GateGraph:
-        from ..core import validate_metadata_namespace
+        # --promote-unresolved overrides the default strict=True.
+        if promote_unresolved:
+            strict = False
+        from ..core import check_schema_version, validate_metadata_namespace
 
         # ---- Load tensors and signal registry ----
         tensors: dict[str, torch.Tensor] = {}
         signal_registry: dict[int, str] = {}
         with safe_open(str(path), framework="pt") as f:
             meta = f.metadata() or {}
+            check_schema_version(meta, "threshold_logic")
             validate_metadata_namespace(type(self), meta)
             if "signal_registry" in meta:
                 raw = json.loads(meta["signal_registry"])

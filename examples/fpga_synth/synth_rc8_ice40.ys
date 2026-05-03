@@ -1,0 +1,5 @@
+read_verilog rc8.v
+hierarchy -check -top rc8
+synth_ice40 -top rc8
+stat
+write_blif rc8_ice40.blif
