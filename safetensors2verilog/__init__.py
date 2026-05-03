@@ -30,4 +30,3 @@ __all__ = [
     "lowering",
     "registered_kinds",
 ]
-__version__ = "0.2.0"
