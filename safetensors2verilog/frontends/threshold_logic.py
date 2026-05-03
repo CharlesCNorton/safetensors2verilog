@@ -212,7 +212,16 @@ class ThresholdLogicFrontend(Frontend):
                 used.add(src)
         outputs = sorted(g.name for g in gates if g.name not in used)
 
-        # External inputs in deterministic order
+        # External inputs: anything referenced but not produced by any gate.
+        # Constants `#0` / `#1` are handled as Verilog literals, not ports.
+        produced = {g.name for g in gates}
+        for g in gates:
+            for src in g.pos + g.neg:
+                if src in ("#0", "#1"):
+                    continue
+                if src not in produced:
+                    external_inputs.add(src)
+
         inputs_list = sorted(external_inputs)
 
         return GateGraph(
