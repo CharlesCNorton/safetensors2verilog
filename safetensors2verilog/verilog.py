@@ -405,6 +405,17 @@ def _lower_mux(ctx: EmitContext, g: Gate) -> list[str]:
     return [f"  assign {ctx.name(g.name)} = {expr};"]
 
 
+@lowering("eq")
+def _lower_eq(ctx: EmitContext, g: Gate) -> list[str]:
+    """1-bit equality comparison: y = (a == b)."""
+    if len(g.inputs) != 2:
+        raise ValueError(f"gate '{g.name}' kind 'eq' expects 2 inputs")
+    a, b = g.inputs
+    return [
+        f"  assign {ctx.name(g.name)} = ({ctx.name(a)} == {ctx.name(b)});"
+    ]
+
+
 @lowering("relu")
 def _lower_relu(ctx: EmitContext, g: Gate) -> list[str]:
     """y = max(0, x). For unsigned x this is identity (always >= 0)."""
@@ -535,13 +546,37 @@ def emit_module(graph: GateGraph) -> str:
         widths[g.name] = max(1, g.output_width)
         signed[g.name] = g.output_signed
 
-    declared: set[str] = {s.name for s in graph.inputs} | {"#0", "#1"}
+    # Register outputs are pre-declared: a `register` gate's D input is a
+    # *sequential* edge (sampled on a clock), not a combinational dependency,
+    # so it doesn't need to be earlier in the topo order. This lets users
+    # build counters and accumulators (output -> +1 -> register -> output)
+    # without the topo sort rejecting the feedback as a cycle.
+    register_outputs = {g.name for g in graph.gates if g.kind == "register"}
+    declared: set[str] = (
+        {s.name for s in graph.inputs} | {"#0", "#1"} | register_outputs
+    )
+
+    all_signals = (
+        {s.name for s in graph.inputs}
+        | {"#0", "#1"}
+        | {g.name for g in graph.gates}
+    )
+
     for g in graph.gates:
         if g.kind not in _lowerings:
             raise ValueError(
                 f"no backend lowering registered for kind '{g.kind}' "
                 f"(gate '{g.name}'). Registered: {registered_kinds()}"
             )
+        if g.kind == "register":
+            # D input only needs to be produced *somewhere* in the graph.
+            for src in g.inputs:
+                if src not in all_signals:
+                    raise ValueError(
+                        f"register gate '{g.name}' D input '{src}' is not "
+                        f"produced by any gate or external input"
+                    )
+            continue
         for src in g.inputs:
             if src not in declared:
                 raise ValueError(
@@ -572,8 +607,6 @@ def emit_module(graph: GateGraph) -> str:
         port_decls.append("  input wire clk")
     if has_reset and "rst" not in explicit_input_names:
         port_decls.append("  input wire rst")
-
-    register_outputs = {g.name for g in graph.gates if g.kind == "register"}
 
     for s in graph.inputs:
         port_decls.append(

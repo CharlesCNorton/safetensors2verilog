@@ -19,7 +19,7 @@ The tool is structured as a small intermediate representation with a pluggable f
 | Frontend | Status | Notes |
 |----------|--------|-------|
 | `threshold_logic` | working | Threshold-gate networks with named-circuit hierarchy and a `signal_registry` metadata map. Ternary weights become direct-sum comparisons; integer weights become constant-coefficient sums (`k*x`). Tested against the [8bit-threshold-computer](https://huggingface.co/phanerozoic/8bit-threshold-computer) family. |
-| `bitnet_linear` | working | BitNet b1.58-style ternary linear layers with multi-bit signed activations. Reads state-dict-style tensor layout (`<prefix>.<n>.weight`, optional `<prefix>.<n>.bias`). Emits one `linear` gate per output neuron over signed buses; supports `--output-clamp LO,HI` for per-layer saturation and `--pipeline` for registered outputs. |
+| `bitnet_linear` | working | BitNet b1.58-style ternary linear layers with multi-bit signed activations. Reads state-dict-style tensor layout (`<prefix>.<n>.weight`, optional `<prefix>.<n>.bias`). Combinational mode emits one `linear` gate per output neuron, with optional `--output-clamp` (per-layer saturation) and `--pipeline` (registered outputs). Sequential mode (`--sequential`) emits a streaming FSM: per-output ternary-weight ROMs addressed by a shared counter, per-layer accumulators, multi-layer chaining via `start`/`done` handshake. |
 | `int8_linear` | working | Quantized linear layers with arbitrary signed integer weights. Same shape as `bitnet_linear` but accepts any integers within `--weight-bits`; same `--output-clamp` and `--pipeline` options. |
 | `onnx_topology` | working (subset) | ONNX file gives the topology, safetensors gives weights. Supported ops: `Gemm`, `MatMul`, `Add`, `Sub`, `Mul`, `Relu`, `Identity`, `Constant`. Anything else raises `NotImplementedError` naming the op. Requires `pip install -e .[onnx]`. |
 
@@ -74,13 +74,21 @@ python -m safetensors2verilog cpu.safetensors \
 # promoting affected inputs to anonymous external ports
 python -m safetensors2verilog cpu.safetensors --strict -o cpu.v
 
-# bitnet_linear: 4-bit signed activations, per-layer saturating clamp,
-# pipelined output (one cycle of latency per layer)
+# bitnet_linear (combinational): 4-bit signed activations, per-layer
+# saturating clamp, pipelined output (one cycle of latency per layer)
 python -m safetensors2verilog model.safetensors \
     --frontend bitnet_linear \
     --activation-bits 4 \
     --output-clamp -8,7 \
     --pipeline \
+    -o model.v
+
+# bitnet_linear (sequential): streaming FSM, per-output ternary-weight ROMs,
+# multi-layer chaining via a start/done handshake
+python -m safetensors2verilog model.safetensors \
+    --frontend bitnet_linear \
+    --activation-bits 4 \
+    --sequential \
     -o model.v
 
 # int8_linear: 8-bit weights, 4-bit activations, custom layer prefix

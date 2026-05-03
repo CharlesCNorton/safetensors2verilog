@@ -165,6 +165,226 @@ def _have_iverilog() -> bool:
     return shutil.which("iverilog") is not None and shutil.which("vvp") is not None
 
 
+def test_sequential_and_pipeline_mutually_exclusive():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "m.safetensors"
+        _save_one_layer(p, weight=[[1, -1]])
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            registry.get("bitnet_linear")().parse(
+                p, sequential=True, pipeline=True
+            )
+
+
+def test_sequential_emits_fsm_and_rom_gates():
+    """Sequential mode produces an FSM (state register, counter, layer_idx)
+    and per-output ROM gates."""
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "m.safetensors"
+        _save_one_layer(p, weight=[[1, -1, 0], [-1, 1, 1]], bias=[3, -2])
+        graph = registry.get("bitnet_linear")().parse(
+            p, top="seq", activation_bits=4, sequential=True
+        )
+        kinds = [g.kind for g in graph.gates]
+        assert "register" in kinds, "sequential mode must use register kind"
+        assert "rom" in kinds, "sequential mode must use rom kind for weights"
+        assert "eq" in kinds, "FSM uses eq for state comparisons"
+        names = {g.name for g in graph.gates}
+        # State machine and counter are wired up
+        assert "state.curr" in names
+        assert "counter.curr" in names
+        # Per-output ROMs and accumulators
+        assert "L0.rom0" in names and "L0.rom1" in names
+        assert "L0.acc0.curr" in names and "L0.acc1.curr" in names
+        # Module ports include start/done
+        assert any(s.name == "start" for s in graph.inputs)
+        assert any(s.name == "done" for s in graph.outputs)
+
+
+def test_sequential_emits_synthesizable_verilog():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "m.safetensors"
+        _save_one_layer(p, weight=[[1, -1, 0], [-1, 1, 1]], bias=[3, -2])
+        graph = registry.get("bitnet_linear")().parse(
+            p, top="seq", activation_bits=4, sequential=True
+        )
+        text = emit_module(graph)
+        assert "input wire clk" in text
+        assert "input wire rst" in text
+        assert "input wire start" in text
+        assert "output wire done" in text
+        assert "always @(posedge clk or posedge rst)" in text
+
+
+def _run_sequential_simulation(td: Path, vpath: Path, in_size: int,
+                               out_widths: dict, cases: list[tuple],
+                               module_name: str = "seq"):
+    """Drive a sequential bitnet module in iverilog. Returns simulator output."""
+    out_names = sorted(out_widths)
+    x_decl = ", ".join(f"x{i}" for i in range(in_size))
+    y_decl = "\n".join(
+        f"  wire signed [{out_widths[n]-1}:0] {n};" for n in out_names
+    )
+    x_inst = ", ".join(f".x{i}(x{i})" for i in range(in_size))
+    y_inst = ", ".join(f".{n}({n})" for n in out_names)
+    fmts = " ".join(f"{n}=%0d" for n in out_names)
+    args = ", ".join(out_names)
+
+    task_inputs = ", ".join(f"input signed [3:0] a{i}" for i in range(in_size))
+    task_assigns = "; ".join(f"x{i} = a{i}" for i in range(in_size)) + ";"
+    case_calls = []
+    for case in cases:
+        ass = ", ".join(str(v) for v in case)
+        case_calls.append(f"    one_inference({ass});")
+
+    tb = f"""\
+`timescale 1ns / 1ps
+
+module tb;
+  reg clk = 0;
+  reg rst = 1;
+  reg start = 0;
+  reg signed [3:0] {x_decl};
+  wire done;
+{y_decl}
+
+  always #5 clk = ~clk;
+
+  {module_name} dut (
+    .clk(clk), .rst(rst), .start(start),
+    {x_inst},
+    .done(done), {y_inst}
+  );
+
+  integer cycles;
+  task one_inference({task_inputs});
+    begin
+      cycles = 0;
+      {task_assigns}
+      @(posedge clk); start = 1;
+      @(posedge clk); start = 0;
+      while (!done) begin
+        @(posedge clk);
+        cycles = cycles + 1;
+        if (cycles > 100) begin $display("TIMEOUT"); $finish; end
+      end
+      $display("RESULT in=({", ".join("%0d" for _ in range(in_size))}) {fmts}",
+               {", ".join(f"a{i}" for i in range(in_size))}, {args});
+    end
+  endtask
+
+  initial begin
+    rst = 1;
+    #20 rst = 0;
+{chr(10).join(case_calls)}
+    $finish;
+  end
+endmodule
+"""
+    tb_path = td / "tb.v"
+    tb_path.write_text(tb)
+    vvp = td / "tb.vvp"
+    subprocess.run(
+        ["iverilog", "-g2012", "-o", str(vvp), str(vpath), str(tb_path)],
+        check=True,
+    )
+    proc = subprocess.run(
+        ["vvp", str(vvp)], check=True, capture_output=True, text=True
+    )
+    return proc.stdout
+
+
+@pytest.mark.skipif(not _have_iverilog(),
+                    reason="iverilog/vvp not on PATH")
+def test_sequential_single_layer_numeric_round_trip():
+    """Single-layer ternary linear running through sequential FSM matches Python."""
+    W = [[1, -1, 0], [-1, 1, 1]]
+    B = [3, -2]
+    cases = [(0, 0, 0), (1, 1, 1), (-1, 0, 1), (3, -2, 1), (-4, 4, -4)]
+
+    def py_eval(x):
+        return [
+            sum(W[j][i] * x[i] for i in range(len(x))) + B[j]
+            for j in range(len(W))
+        ]
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        sf = td / "m.safetensors"
+        save_file(
+            {
+                "layers.0.weight": torch.tensor(W, dtype=torch.int8),
+                "layers.0.bias":   torch.tensor(B, dtype=torch.int32),
+            },
+            str(sf),
+        )
+        graph = registry.get("bitnet_linear")().parse(
+            sf, top="seq", activation_bits=4, sequential=True
+        )
+        verilog = emit_module(graph)
+        out_widths = {s.name: s.width for s in graph.outputs if s.name != "done"}
+        vpath = td / "seq.v"
+        vpath.write_text(verilog)
+        output = _run_sequential_simulation(td, vpath, 3, out_widths, cases, "seq")
+
+    for case in cases:
+        line = next(l for l in output.splitlines() if l.startswith("RESULT")
+                    and f"in=({', '.join(str(v) for v in case)})" in l)
+        parts = dict(t.split("=") for t in line.split() if "=" in t)
+        sim = [int(parts[f"y{i}"]) for i in range(2)]
+        expected = py_eval(list(case))
+        assert sim == expected, f"case {case}: sim={sim} expected={expected}"
+
+
+@pytest.mark.skipif(not _have_iverilog(),
+                    reason="iverilog/vvp not on PATH")
+def test_sequential_multi_layer_numeric_round_trip():
+    """Two-layer 3->2->1 ternary linear in sequential mode matches Python."""
+    W1 = [[1, -1, 0], [-1, 1, 1]]
+    B1 = [3, -2]
+    W2 = [[1, -1]]
+    B2 = [5]
+    cases = [(0, 0, 0), (1, 1, 1), (-1, 0, 1), (3, -2, 1), (-4, 4, -4)]
+
+    def py_eval(x):
+        h = [
+            sum(W1[j][i] * x[i] for i in range(len(x))) + B1[j]
+            for j in range(len(W1))
+        ]
+        return [
+            sum(W2[j][i] * h[i] for i in range(len(h))) + B2[j]
+            for j in range(len(W2))
+        ]
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        sf = td / "m.safetensors"
+        save_file(
+            {
+                "layers.0.weight": torch.tensor(W1, dtype=torch.int8),
+                "layers.0.bias":   torch.tensor(B1, dtype=torch.int32),
+                "layers.1.weight": torch.tensor(W2, dtype=torch.int8),
+                "layers.1.bias":   torch.tensor(B2, dtype=torch.int32),
+            },
+            str(sf),
+        )
+        graph = registry.get("bitnet_linear")().parse(
+            sf, top="seq2", activation_bits=4, sequential=True
+        )
+        verilog = emit_module(graph)
+        out_widths = {s.name: s.width for s in graph.outputs if s.name != "done"}
+        vpath = td / "seq2.v"
+        vpath.write_text(verilog)
+        output = _run_sequential_simulation(td, vpath, 3, out_widths, cases, "seq2")
+
+    for case in cases:
+        line = next(l for l in output.splitlines() if l.startswith("RESULT")
+                    and f"in=({', '.join(str(v) for v in case)})" in l)
+        parts = dict(t.split("=") for t in line.split() if "=" in t)
+        sim = [int(parts["y0"])]
+        expected = py_eval(list(case))
+        assert sim == expected, f"case {case}: sim={sim} expected={expected}"
+
+
 @pytest.mark.skipif(not _have_iverilog(),
                     reason="iverilog/vvp not on PATH")
 def test_numeric_round_trip_against_python():

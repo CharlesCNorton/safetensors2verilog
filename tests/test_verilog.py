@@ -461,6 +461,50 @@ def test_register_without_rst():
     assert "always @(posedge clk or" not in text
 
 
+def test_register_feedback_counter():
+    """A counter is a register whose D input feeds back through +1.
+
+    Output -> add -> register -> output forms a sequential cycle that
+    the topo validator must allow.
+    """
+    g = GateGraph(
+        inputs=[],
+        outputs=[Signal("counter", width=4)],
+        gates=[
+            Gate(name="one", kind="constant",
+                 attrs={"value": 1}, output_width=4),
+            Gate(name="counter_next", kind="add",
+                 inputs=["counter", "one"],
+                 output_width=4),
+            Gate(name="counter", kind="register",
+                 inputs=["counter_next"],
+                 attrs={"clk": "clk", "rst": "rst"},
+                 output_width=4),
+        ],
+        top="cnt",
+    )
+    text = emit_module(g)
+    # Should emit clean Verilog with a feedback assign and an always block.
+    assert "input wire clk" in text
+    assert "input wire rst" in text
+    assert "counter_next" in text
+    assert "always @(posedge clk or posedge rst)" in text
+
+
+def test_register_d_input_validation():
+    """A register's D input must be produced by some gate or external input."""
+    g = GateGraph(
+        inputs=[],
+        outputs=[Signal("q", width=1)],
+        gates=[Gate(name="q", kind="register",
+                    inputs=["nonexistent"],
+                    attrs={"clk": "clk"}, output_width=1)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="not produced"):
+        emit_module(g)
+
+
 # ---- Constant edge cases ----------------------------------------------------
 
 
