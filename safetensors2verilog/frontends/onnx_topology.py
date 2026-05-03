@@ -301,18 +301,26 @@ class OnnxTopologyFrontend(Frontend):
 
                 a_sigs = list(val_signals[ins[0]])
                 b_sigs = list(val_signals[ins[1]])
-                # Scalar-vector broadcasting: a length-1 operand replicates
-                # to match the length of the other.
+                # Broadcasting: scalar-vector (length 1 splats), or
+                # vector-vector where one length evenly divides the other
+                # (the smaller side tiles to match). Full numpy broadcasting
+                # over multidimensional shapes is gated on IR shape support
+                # (see docs/DEFERRED.md).
                 if len(a_sigs) != len(b_sigs):
                     if len(a_sigs) == 1:
                         a_sigs = a_sigs * len(b_sigs)
                     elif len(b_sigs) == 1:
                         b_sigs = b_sigs * len(a_sigs)
+                    elif len(a_sigs) > len(b_sigs) and len(a_sigs) % len(b_sigs) == 0:
+                        b_sigs = b_sigs * (len(a_sigs) // len(b_sigs))
+                    elif len(b_sigs) > len(a_sigs) and len(b_sigs) % len(a_sigs) == 0:
+                        a_sigs = a_sigs * (len(b_sigs) // len(a_sigs))
                     else:
                         raise NotImplementedError(
                             f"{op} node '{node.name}': vector-vector "
                             f"broadcasting ({len(a_sigs)} vs {len(b_sigs)}) "
-                            f"not supported; only scalar-vector"
+                            f"not supported; sizes must match, one must be "
+                            f"1, or one must evenly divide the other"
                         )
                 width = max(val_widths[ins[0]], val_widths[ins[1]]) + 1
                 kind = {"Add": "add", "Sub": "sub", "Mul": "mul"}[op]
@@ -409,36 +417,58 @@ class OnnxTopologyFrontend(Frontend):
                     offset += size
 
             elif op == "Gather":
-                # data[indices]; we support 1-D data and integer indices
-                # supplied as an initializer.
+                # data[indices]: static indices (initializer) become a
+                # signal-list permutation; dynamic indices (value port)
+                # become a per-output mux.
                 data_name, idx_name = ins[0], ins[1]
                 if data_name not in val_signals:
                     raise ValueError(
                         f"Gather node '{node.name}': data '{data_name}' "
                         f"unresolved"
                     )
-                if idx_name not in initializers:
-                    raise NotImplementedError(
-                        f"Gather node '{node.name}': dynamic indices "
-                        f"(non-initializer) not supported"
-                    )
-                indices = [
-                    int(v) for v in initializers[idx_name].flatten().tolist()
-                ]
                 src_sigs = val_signals[data_name]
-                gathered = []
-                for k in indices:
-                    if k < 0:
-                        k += len(src_sigs)
-                    if not 0 <= k < len(src_sigs):
+                src_w = val_widths[data_name]
+                src_signed = val_signed[data_name]
+                if idx_name in initializers:
+                    indices = [
+                        int(v) for v in initializers[idx_name].flatten().tolist()
+                    ]
+                    gathered = []
+                    for k in indices:
+                        if k < 0:
+                            k += len(src_sigs)
+                        if not 0 <= k < len(src_sigs):
+                            raise ValueError(
+                                f"Gather node '{node.name}': index {k} out "
+                                f"of range for length {len(src_sigs)}"
+                            )
+                        gathered.append(src_sigs[k])
+                    val_signals[outs[0]] = gathered
+                    val_widths[outs[0]] = src_w
+                    val_signed[outs[0]] = src_signed
+                else:
+                    # Dynamic indices: each index signal feeds a mux that
+                    # selects from src_sigs. Index signals must have width
+                    # >= ceil(log2(len(src_sigs))) for clean indexing.
+                    if idx_name not in val_signals:
                         raise ValueError(
-                            f"Gather node '{node.name}': index {k} out of "
-                            f"range for length {len(src_sigs)}"
+                            f"Gather node '{node.name}': index '{idx_name}' "
+                            f"is neither an initializer nor a produced signal"
                         )
-                    gathered.append(src_sigs[k])
-                val_signals[outs[0]] = gathered
-                val_widths[outs[0]] = val_widths[data_name]
-                val_signed[outs[0]] = val_signed[data_name]
+                    idx_sigs = val_signals[idx_name]
+                    label = node.name or f"gather_{len(gates)}"
+                    out_sigs = []
+                    for k, idx_sig in enumerate(idx_sigs):
+                        out_name = f"{label}.{k}"
+                        gates.append(Gate(
+                            name=out_name, kind="mux",
+                            inputs=[idx_sig] + list(src_sigs),
+                            output_width=src_w, output_signed=src_signed,
+                        ))
+                        out_sigs.append(out_name)
+                    val_signals[outs[0]] = out_sigs
+                    val_widths[outs[0]] = src_w
+                    val_signed[outs[0]] = src_signed
 
             elif op == "Relu":
                 in_sigs = val_signals[ins[0]]

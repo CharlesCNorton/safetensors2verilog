@@ -705,6 +705,31 @@ def test_emit_top_wrapper_validates_names():
                          wrapper_name="ok2")
 
 
+def test_emit_top_wrapper_honors_port_map_overrides():
+    """Port_map lets the user point to non-default core / bram port names."""
+    from safetensors2verilog import emit_top_wrapper
+    text = emit_top_wrapper(
+        core_module="cpu_core",
+        bram_module="my_bram",
+        addr_bits=12, data_bits=8,
+        wrapper_name="cpu_with_bram",
+        core_port_map={
+            "addr": "mem_addr_o",
+            "data_in": "mem_wdata_o",
+            "data_out": "mem_rdata_i",
+            "we": "mem_we_o",
+        },
+        bram_port_map={
+            "addr": "a", "data_in": "din",
+            "data_out": "dout", "we": "wen",
+        },
+    )
+    assert ".mem_addr_o(addr)" in text
+    assert ".mem_we_o(we)" in text
+    assert ".a(addr)" in text
+    assert ".wen(we)" in text
+
+
 # ---- Constant edge cases ----------------------------------------------------
 
 

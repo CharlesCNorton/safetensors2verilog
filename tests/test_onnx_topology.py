@@ -286,6 +286,56 @@ def test_onnx_topology_gather():
         assert len(result.outputs) == 3
 
 
+def test_onnx_topology_vector_vector_tile_broadcast():
+    """When one Add operand is shorter and divides the other, it tiles."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 6])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 6])
+        # length-2 bias tiles 3x to match length-6 input
+        bias = numpy_helper.from_array(
+            torch.tensor([1, 2], dtype=torch.float32).numpy(), name="bias"
+        )
+        node = helper.make_node("Add", ["x", "bias"], ["y"], "tile_add")
+        graph = helper.make_graph([node], "g", [x], [y], [bias])
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+        result = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=4
+        )
+        adds = [g for g in result.gates if g.kind == "add"]
+        assert len(adds) == 6  # one per output element
+
+
+def test_onnx_topology_dynamic_gather_emits_mux():
+    """Gather with dynamic index ports lowers to per-output mux gates."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+        idx = helper.make_tensor_value_info("idx", TensorProto.FLOAT, [1, 2])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 2])
+        node = helper.make_node("Gather", ["x", "idx"], ["y"], "g", axis=1)
+        graph = helper.make_graph([node], "g", [x, idx], [y], [])
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 13)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+        result = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=4
+        )
+        # Should produce 2 mux gates, one per output index
+        muxes = [g for g in result.gates if g.kind == "mux"]
+        assert len(muxes) == 2
+
+
 def test_onnx_topology_unsupported_op_lists_alternatives():
     """The error message should list supported ops and known deferred ops."""
     with tempfile.TemporaryDirectory() as td:

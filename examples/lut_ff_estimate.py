@@ -113,19 +113,92 @@ def state_bits(m: dict) -> int:
     return pc + ir + regs + flags + sp + ctrl + mem_bits
 
 
+def estimate_from_gategraph(graph) -> dict:
+    """Estimate LUT count by walking a GateGraph from any frontend.
+
+    Approximates each gate's LUT cost based on its kind and fan-in.
+    Coarse but frontend-agnostic; runs against bitnet_linear, int8_linear,
+    onnx_topology output as well as threshold_logic.
+    """
+    luts = 0
+    ffs = 0
+    by_kind: dict[str, int] = {}
+    fanin_buckets = {"<=6": 0, "7-12": 0, "13-24": 0, "25-64": 0, ">64": 0}
+
+    for g in graph.gates:
+        by_kind[g.kind] = by_kind.get(g.kind, 0) + 1
+        if g.kind == "register":
+            ffs += max(1, g.output_width)
+            continue
+        if g.kind == "rom":
+            depth = int(g.attrs.get("depth", 0))
+            width = int(g.attrs.get("width", 1))
+            # ROMs typically map to LUTRAM or BRAM; rough estimate for LUTRAM
+            luts += max(1, (depth * width) // 6)
+            continue
+        if g.kind == "constant" or g.kind == "parameter":
+            continue
+        # Fan-in is the number of inputs (with weights summed for threshold/linear)
+        if g.kind in ("threshold", "linear"):
+            weights = g.attrs.get("weights", [])
+            fanin = sum(abs(int(w)) for w in weights) or len(g.inputs)
+        else:
+            fanin = len(g.inputs) * max(1, g.output_width)
+        gate_luts = luts_for_fanin(fanin)
+        luts += gate_luts
+        if fanin <= 6: fanin_buckets["<=6"] += 1
+        elif fanin <= 12: fanin_buckets["7-12"] += 1
+        elif fanin <= 24: fanin_buckets["13-24"] += 1
+        elif fanin <= 64: fanin_buckets["25-64"] += 1
+        else: fanin_buckets[">64"] += 1
+
+    return {
+        "gates": len(graph.gates),
+        "luts_estimate": luts,
+        "ffs_estimate": ffs,
+        "kinds": by_kind,
+        "fanin_dist": fanin_buckets,
+    }
+
+
 def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "variants_dir", nargs="?", type=Path, default=DEFAULT_VARIANTS_DIR,
-        help=f"directory containing .safetensors variants "
-             f"(default: {DEFAULT_VARIANTS_DIR})",
+        "path", nargs="?", type=Path, default=DEFAULT_VARIANTS_DIR,
+        help=f"directory containing .safetensors variants OR a single "
+             f".safetensors file (default: {DEFAULT_VARIANTS_DIR})",
+    )
+    parser.add_argument(
+        "--frontend", type=str, default=None,
+        help="when set, run the safetensors through this frontend and "
+             "estimate from the resulting GateGraph instead of the "
+             "threshold-computer-specific manifest reader.",
     )
     args = parser.parse_args()
-    variants_dir = args.variants_dir
+    target = args.path
 
+    if args.frontend:
+        from safetensors2verilog.core import registry
+        files = (
+            sorted(target.glob("*.safetensors")) if target.is_dir() else [target]
+        )
+        if not files:
+            print(f"no .safetensors at {target}", file=sys.stderr)
+            return 2
+        fe = registry.get(args.frontend)()
+        print(f"{'file':<48} {'gates':>10} {'LUT est':>10} {'FF est':>10}")
+        print("-" * 82)
+        for f in files:
+            graph = fe.parse(f, top="est")
+            info = estimate_from_gategraph(graph)
+            print(f"{f.name:<48} {info['gates']:>10,} "
+                  f"{info['luts_estimate']:>10,} {info['ffs_estimate']:>10,}")
+        return 0
+
+    variants_dir = target
     if not variants_dir.exists():
-        print(f"variants dir not found: {variants_dir}", file=sys.stderr)
+        print(f"path not found: {variants_dir}", file=sys.stderr)
         return 2
 
     files = sorted(variants_dir.glob("*.safetensors"))
