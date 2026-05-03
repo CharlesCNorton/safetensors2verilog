@@ -10,7 +10,6 @@ import shutil
 
 import pytest
 
-
 SAMPLE_YOSYS_LOG = """
 1. Executing Verilog-2005 frontend.
 ...
@@ -48,7 +47,8 @@ def test_parse_stat_block(monkeypatch):
     monkeypatch.setattr(synth.subprocess, "run", fake_run)
 
     # We need a real file path so the existence check passes.
-    import tempfile, os
+    import os
+    import tempfile
     f = tempfile.NamedTemporaryFile(suffix=".v", delete=False)
     f.write(b"module rc8(); endmodule\n")
     f.close()

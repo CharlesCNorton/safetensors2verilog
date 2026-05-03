@@ -18,7 +18,7 @@ from hypothesis import HealthCheck, assume, given, settings  # noqa: E402
 from hypothesis import strategies as st  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
-from safetensors2verilog.extract import closure_keys, extract_subset  # noqa: E402
+from safetensors2verilog.extract import extract_subset  # noqa: E402
 from safetensors2verilog.frontends.threshold_logic import (  # noqa: E402
     ThresholdLogicFrontend,
 )

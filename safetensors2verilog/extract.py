@@ -42,7 +42,6 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-
 _SUFFIXES = (".weight", ".bias", ".inputs")
 
 

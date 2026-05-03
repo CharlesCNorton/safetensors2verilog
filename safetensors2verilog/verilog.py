@@ -876,8 +876,8 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
         if s.name in input_bus_members:
             # find which bus this member belongs to
             m = _BUS_BIT_RE.match(s.name)
-            base = m.group("base") if m else None
-            if base in input_buses and base not in emitted_bus_bases:
+            base = m.group("base") if m else ""
+            if base and base in input_buses and base not in emitted_bus_bases:
                 width = len(input_buses[base])
                 bus_id = sigmap[("__bus__", base)]   # type: ignore[index]
                 decl = _signal_decl("input", "wire", bus_id, width, False)

@@ -25,10 +25,6 @@ from collections import defaultdict, deque
 from .core import GateGraph
 
 
-def _producer_map(graph: GateGraph) -> dict[str, str]:
-    return {g.name: g.kind for g in graph.gates}
-
-
 def gate_depths(graph: GateGraph) -> dict[str, int]:
     """Longest path (in gates) from any external input to each gate.
 
@@ -36,7 +32,6 @@ def gate_depths(graph: GateGraph) -> dict[str, int]:
     Register outputs reset to depth 1: their D input belongs to the
     previous clock cycle, so the combinational chain restarts.
     """
-    kinds = _producer_map(graph)
     depths: dict[str, int] = {}
     # Gates list is already topologically sorted (the backend enforces this).
     for g in graph.gates:

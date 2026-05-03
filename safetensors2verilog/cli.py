@@ -134,6 +134,7 @@ def _apply_top_outputs_filter(graph: GateGraph, spec: str) -> GateGraph:
     accidental typo doesn't silently produce a portless module.
     """
     import warnings
+
     from .core import Signal
 
     requested = [t for t in spec.replace(",", " ").split() if t]
@@ -533,8 +534,9 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 "--circuit is only supported with --frontend threshold_logic"
             )
-        from .extract import extract_subset
         import tempfile
+
+        from .extract import extract_subset
         tmpdir = Path(tempfile.mkdtemp(prefix="s2v_extract_"))
         cleanup_temp = tmpdir
         parse_path = tmpdir / "subset.safetensors"

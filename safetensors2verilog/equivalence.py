@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import random
 import re
-from collections.abc import Iterable
 
 from .core import GateGraph
 

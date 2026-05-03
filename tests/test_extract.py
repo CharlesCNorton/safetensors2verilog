@@ -82,8 +82,8 @@ def test_closure_unknown_prefix_raises(tmp_path):
 
 def test_closure_keys_direct(tmp_path):
     src = _build_fixture(tmp_path)
-    from safetensors.torch import load_file
     from safetensors import safe_open
+    from safetensors.torch import load_file
     with safe_open(str(src), framework="pt") as f:
         meta = f.metadata()
     sr = {int(k): v for k, v in json.loads(meta["signal_registry"]).items()}
@@ -99,6 +99,7 @@ def test_closure_keys_direct(tmp_path):
 def test_schema_version_unsupported_raises(tmp_path):
     """Files declaring an unknown schema_version must be rejected."""
     import json
+
     import torch
     from safetensors.torch import save_file
     src = tmp_path / "future.safetensors"
@@ -112,14 +113,16 @@ def test_schema_version_unsupported_raises(tmp_path):
             "signal_registry": json.dumps({"10": "$x", "11": "$y"}),
         },
     )
-    from safetensors2verilog.frontends.threshold_logic import ThresholdLogicFrontend
     import pytest
+
+    from safetensors2verilog.frontends.threshold_logic import ThresholdLogicFrontend
     with pytest.raises(ValueError, match="unsupported schema_version"):
         ThresholdLogicFrontend().parse(src)
 
 
 def test_schema_version_v1_explicit_accepted(tmp_path):
     import json
+
     import torch
     from safetensors.torch import save_file
     src = tmp_path / "v1.safetensors"

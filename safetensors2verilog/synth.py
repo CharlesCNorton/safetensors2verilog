@@ -30,7 +30,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
 _KIND_PATTERN = re.compile(r"^\s*(\d+)\s+\$_(\w+?)_(?:\s|$)")
 
 
