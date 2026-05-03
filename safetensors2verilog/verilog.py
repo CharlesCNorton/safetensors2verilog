@@ -638,24 +638,22 @@ def _detect_buses(
     """Group signals of the form 'base[i]' into per-base buses.
 
     Returns (buses, members) where:
-      buses[base]   -> sorted list of (index, original_name) tuples
+      buses[base]   -> sorted (index, original_name) pairs, low index first
       members       -> set of original signal names that became bus members
 
-    Only buses whose indices form a contiguous range starting at 0 are
-    accepted; partial buses (gaps, non-zero start) fall through to flat
-    emission so a 7-bit subset doesn't pollute the namespace.
+    Accepts any contiguous index range (`[0..N-1]`, `[1..N]`, descending
+    `[N-1..0]`, etc.) so long as the indices form a gap-free interval and
+    there are at least two of them. Bus members must be 1-bit signals.
     """
     groups: dict[str, list[tuple[int, str]]] = {}
     for s in signals:
         m = _BUS_BIT_RE.match(s.name)
         if not m:
             continue
-        base = m.group("base")
-        idx = int(m.group("idx"))
-        # All bus members must share width / signedness; we conservatively
-        # only group 1-bit ports.
         if s.width != 1:
             continue
+        base = m.group("base")
+        idx = int(m.group("idx"))
         groups.setdefault(base, []).append((idx, s.name))
 
     buses: dict[str, list[tuple[int, str]]] = {}
@@ -663,7 +661,10 @@ def _detect_buses(
     for base, items in groups.items():
         items.sort()
         indices = [i for i, _ in items]
-        if indices == list(range(len(indices))) and len(indices) >= 2:
+        if len(indices) < 2:
+            continue
+        lo, hi = indices[0], indices[-1]
+        if indices == list(range(lo, hi + 1)):
             buses[base] = items
             for _, nm in items:
                 members.add(nm)
@@ -878,9 +879,11 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
             m = _BUS_BIT_RE.match(s.name)
             base = m.group("base") if m else ""
             if base and base in input_buses and base not in emitted_bus_bases:
-                width = len(input_buses[base])
+                items = input_buses[base]
+                lo = items[0][0]
+                hi = items[-1][0]
                 bus_id = sigmap[("__bus__", base)]   # type: ignore[index]
-                decl = _signal_decl("input", "wire", bus_id, width, False)
+                decl = f"  input wire [{hi}:{lo}] {bus_id}"
                 port_decls.append(decl)
                 port_decl_pairs.append((base, decl))
                 emitted_bus_bases.add(base)

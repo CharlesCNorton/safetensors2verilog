@@ -109,10 +109,17 @@ def run_synth(
     cells = 0
     in_stat = False
     stat_block_re = re.compile(rf"^=== {re.escape(top)} ===")
+    printing_stats_re = re.compile(r"Printing statistics", re.IGNORECASE)
     cells_total_re = re.compile(r"^\s*(\d+)\s+cells\s*$")
+    cells_total_alt_re = re.compile(r"Number of cells:\s*(\d+)")
 
     for line in log.splitlines():
-        if stat_block_re.match(line):
+        if stat_block_re.match(line) or printing_stats_re.search(line):
+            in_stat = True
+            continue
+        m_alt = cells_total_alt_re.search(line)
+        if m_alt:
+            cells = int(m_alt.group(1))
             in_stat = True
             continue
         if not in_stat:
@@ -126,7 +133,9 @@ def run_synth(
             count = int(m.group(1))
             kind = m.group(2)
             cells_by_kind[kind] = count
-        elif line.startswith("End of script") or line.startswith("==="):
+        elif line.startswith("End of script") or (
+            line.startswith("===") and not stat_block_re.match(line)
+        ):
             in_stat = False
 
     if cells == 0 and cells_by_kind:

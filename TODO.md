@@ -2,6 +2,22 @@
 
 Open items, renumbered. Completed items have been removed; the implementations live in the source tree and the rationale for each is in the relevant commit message.
 
+Recently shipped (not in this list):
+
+- Dependency-closure subset extractor (`extract.py`) and CLI `--circuit` flag.
+- Schema versioning on safetensors metadata (`core.SIGNAL_REGISTRY_SCHEMA_VERSION_LATEST`).
+- Strict-by-default frontend behavior; `--promote-unresolved` opt-in for the old permissive path.
+- Self-checking iverilog equivalence harness (`equivalence.py`, `--equiv-check`) and SymbiYosys equiv template (`--emit-sby-equiv`).
+- Static-analysis: depth, fanout, critical path (`analysis.py`, `--report`).
+- Pipeline-register insertion transform (`transforms.py`, `--pipeline-every`).
+- Bus-packed port emission for any contiguous-index family (`--pack-buses`); port grouping by dotted prefix (`--group-ports`).
+- Output-trim flag (`--top-outputs`); per-circuit port-contract printer (`--inspect`); circuit listing (`--list-circuits`).
+- Yosys+ABC synthesis-stats wrapper (`synth.py`, `--synth-stats`).
+- Metadata pass-through into Verilog header (`--metadata-passthrough`).
+- iCE40 worked example with measured cell count (`examples/fpga_synth/`).
+
+Open:
+
 1. ONNX `Conv` / `ConvTranspose` — needs a 2-D windowed access primitive in the IR (item 9 below).
 2. ONNX `LayerNorm`, `GroupNorm`, `BatchNorm` — need fixed-point sqrt and divide primitives.
 3. ONNX `Softmax`, `Sigmoid`, `Tanh`, `Exp` — need fixed-point transcendentals (lookup tables or iterative algorithms).

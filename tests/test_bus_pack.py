@@ -38,6 +38,44 @@ def test_bus_packing_off_by_default():
     assert text.count("\n  input wire") == 8
 
 
+def test_bus_packing_accepts_nonzero_base():
+    """Indices [1..N] are contiguous and should pack to [N:1]."""
+    inputs = [Signal(name=f"$a[{i}]", width=1) for i in (1, 2, 3, 4)]
+    g = GateGraph(
+        inputs=inputs,
+        outputs=[Signal("y")],
+        gates=[Gate(
+            name="y", kind="threshold",
+            inputs=[f"$a[{i}]" for i in (1, 2, 3, 4)],
+            attrs={"weights": [1, 1, 1, 1], "bias": -2},
+            output_width=1,
+        )],
+        top="b",
+    )
+    text = emit_module(g, pack_buses=True)
+    assert "input wire [4:1] a" in text
+    # Body still uses the original indices
+    assert "a[1]" in text and "a[4]" in text
+
+
+def test_bus_packing_accepts_descending_input_order():
+    """Member signals listed high-to-low should still pack."""
+    inputs = [Signal(name=f"$a[{i}]", width=1) for i in (3, 2, 1, 0)]
+    g = GateGraph(
+        inputs=inputs,
+        outputs=[Signal("y")],
+        gates=[Gate(
+            name="y", kind="threshold",
+            inputs=[f"$a[{i}]" for i in (3, 2, 1, 0)],
+            attrs={"weights": [1, 1, 1, 1], "bias": -2},
+            output_width=1,
+        )],
+        top="b",
+    )
+    text = emit_module(g, pack_buses=True)
+    assert "input wire [3:0] a" in text
+
+
 def test_bus_packing_skips_partial_bus():
     """Buses with non-contiguous indices stay flat."""
     inputs = [Signal(name="$a[0]"), Signal(name="$a[2]"),

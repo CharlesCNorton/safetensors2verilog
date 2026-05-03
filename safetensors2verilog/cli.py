@@ -451,6 +451,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--list-circuits", action="store_true",
+        help=(
+            "list every circuit prefix present in the input safetensors "
+            "file and exit. Threshold-logic frontend only. Useful for "
+            "discovering valid --circuit values."
+        ),
+    )
+    parser.add_argument(
         "--circuit", action="append", default=None, metavar="PREFIX",
         help=(
             "extract a single named circuit (with dependency closure) "
@@ -494,6 +502,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("input safetensors path is required (or use --list-frontends)")
     if not args.input.exists():
         parser.error(f"file not found: {args.input}")
+
+    if args.list_circuits:
+        from safetensors import safe_open
+        prefixes: set[str] = set()
+        suffixes = (".weight", ".bias", ".inputs")
+        with safe_open(str(args.input), framework="pt") as f:
+            for k in f.keys():
+                for suf in suffixes:
+                    if k.endswith(suf):
+                        gate = k[: -len(suf)]
+                        if gate.startswith("manifest."):
+                            break
+                        # Group by first 2 dotted segments
+                        parts = gate.split(".")
+                        prefixes.add(".".join(parts[:2]) if len(parts) >= 2 else gate)
+                        break
+        for p in sorted(prefixes):
+            print(p)
+        return 0
 
     try:
         frontend_cls = registry.get(args.frontend)
