@@ -2,24 +2,28 @@
 
 Compile safetensors-stored networks to synthesis-ready Verilog.
 
-The HuggingFace ecosystem stores model weights in `.safetensors` files. The FPGA ecosystem speaks Verilog. There is currently no bridge between them. This tool aims to be that bridge.
+The HuggingFace ecosystem stores model weights in `.safetensors`. The FPGA ecosystem speaks Verilog. This tool is the bridge.
 
 ## What it does
 
 Given a `.safetensors` file containing a network's weights and (where needed) a description of how those weights wire together, this tool emits Verilog modules that compute the same function the network does. The output is intended for synthesis through the standard FPGA toolchains (Yosys, Vivado, Quartus) and for simulation through Icarus Verilog or Verilator.
 
-The tool is structured around **frontends**: one per model class. Each frontend knows how to interpret a particular family of safetensors files (which tensors are weights, which are biases, what activation function applies, how the dataflow connects). The shared backend handles Verilog emission — declarations, hierarchical modules, signed arithmetic, common patterns like popcount.
+The tool is structured as a small intermediate representation with a pluggable frontend interface and a kind-dispatched Verilog backend:
+
+- **Frontends** read a particular family of safetensors files and produce a `GateGraph` of typed `Gate` nodes.
+- **Gate kinds** include `threshold`, `add`, `sub`, `mul`, `and`, `or`, `xor`, `not`, `shift_left`, `shift_right`, `concat`, `slice`, `mux`, `relu`, `clamp`, `register`, `rom`, and `constant`. Custom kinds register via `@lowering(kind)`.
+- **Signals** carry width and signedness, so multi-bit signed buses, ROMs, and registered logic all flow through the same emit pipeline.
 
 ## Status
 
 | Frontend | Status | Notes |
 |----------|--------|-------|
-| `threshold_logic` | working | Threshold-gate networks with named-circuit hierarchy and a `signal_registry` metadata map. Ternary weights become direct-sum comparisons; no multipliers in the generated RTL. Tested against the [8bit-threshold-computer](https://huggingface.co/phanerozoic/8bit-threshold-computer) family. |
-| `bitnet_linear` | planned | BitNet b1.58-style ternary linear layers; activations passed in as fixed-point. |
-| `int8_linear` | planned | Standard quantized `nn.Linear` with int8 weights. |
+| `threshold_logic` | working | Threshold-gate networks with named-circuit hierarchy and a `signal_registry` metadata map. Ternary weights become direct-sum comparisons; integer weights become constant-coefficient sums (`k*x`). Tested against the [8bit-threshold-computer](https://huggingface.co/phanerozoic/8bit-threshold-computer) family. |
+| `bitnet_linear` | working | BitNet b1.58-style ternary linear layers; multi-bit signed activations. Reads state-dict-style tensor layout (`<prefix>.<n>.weight`, optional `<prefix>.<n>.bias`). Emits per-output MAC chains as add/sub/constant gates over signed buses, with the accumulator widening per layer. |
+| `int8_linear` | planned | Standard quantized `nn.Linear` with int8 weights. The IR already supports the necessary multi-bit signed arithmetic; the frontend itself is not yet written. |
 | `onnx_topology` | planned | Use an ONNX file to describe the dataflow, fetch weights from safetensors. |
 
-Adding a new frontend means subclassing `Frontend` and implementing two methods: parse the safetensors file into a graph of named operations, and translate each operation kind into a Verilog snippet. The shared backend handles the rest.
+Adding a new frontend means subclassing `Frontend` and implementing `parse(path) -> GateGraph`. Operations are expressed as `Gate(kind, inputs, attrs, output_width, output_signed)`. The Verilog backend handles signal sanitization, port emission, topological-order validation, and per-kind lowering. See `safetensors2verilog/frontends/threshold_logic.py` and `bitnet_linear.py` as references.
 
 ## Install
 
@@ -29,40 +33,147 @@ cd safetensors2verilog
 pip install -e .
 ```
 
-Requires Python 3.10+, `torch`, `safetensors`. For simulation in the test suite: `iverilog`.
+For the test suite:
+
+```bash
+pip install -e .[test]
+```
+
+Requires Python 3.10+, `torch`, `safetensors`. The integration test (`examples/threshold_alu/run.py`) and most simulation work also need `iverilog` on `PATH`.
 
 ## Usage
 
 ```bash
-# Threshold-logic frontend
+# Compile via the threshold-logic frontend
 python -m safetensors2verilog input.safetensors --frontend threshold_logic -o output.v
 
-# With a custom top-level module name
+# Custom top-level module name
 python -m safetensors2verilog input.safetensors --frontend threshold_logic -o output.v --top my_design
 
 # List available frontends
 python -m safetensors2verilog --list-frontends
+
+# List a frontend's specific options
+python -m safetensors2verilog --list-frontend-options threshold_logic
+python -m safetensors2verilog --list-frontend-options bitnet_linear
+```
+
+### Per-frontend options
+
+Each frontend self-describes its CLI flags via `Frontend.options()`. After choosing `--frontend`, those flags become available on the same command line.
+
+```bash
+# threshold_logic: drop memory.* gates and emit a vendor BRAM template
+python -m safetensors2verilog cpu.safetensors \
+    --frontend threshold_logic \
+    --skip-memory \
+    --emit-bram-template bram.v \
+    -o cpu_core.v
+
+# threshold_logic: error out on stale or unresolved routing instead of
+# promoting affected inputs to anonymous external ports
+python -m safetensors2verilog cpu.safetensors --strict -o cpu.v
+
+# bitnet_linear: 4-bit signed activations, custom layer prefix
+python -m safetensors2verilog model.safetensors \
+    --frontend bitnet_linear \
+    --activation-bits 4 \
+    --layer-prefix backbone.linear \
+    -o model.v
 ```
 
 ## Worked example
 
-The `examples/threshold_alu/` directory walks through converting a small piece of the threshold-computer's 8-bit ALU (the boolean gates and ripple-carry adder), simulating the resulting Verilog with Icarus Verilog, and cross-checking output against a Python evaluation of the same threshold network on the same inputs. Run it with `python examples/threshold_alu/run.py`.
+`examples/threshold_alu/run.py` builds a small threshold-network half-adder, converts it to Verilog, simulates with Icarus Verilog, and cross-checks the simulator output against a Python evaluation of the same network. It runs as part of CI.
 
-## How threshold-logic conversion works
+```bash
+python examples/threshold_alu/run.py
+```
 
-A threshold gate computes `output = 1 if (Σ wᵢ·xᵢ + b) ≥ 0 else 0`. With ternary weights `wᵢ ∈ {-1, 0, 1}`, the weighted sum is `popcount(positive-weighted inputs) − popcount(negative-weighted inputs)`. Comparing that to `−b` is a single integer comparison. So each gate compiles to one Verilog `wire` plus one `assign`:
+## How the threshold-logic frontend works
+
+A threshold gate computes `output = 1 if (Σ wᵢ·xᵢ + b) ≥ 0 else 0`. With ternary weights `wᵢ ∈ {-1, 0, 1}`, the weighted sum is `popcount(positive-weighted inputs) − popcount(negative-weighted inputs)`. Comparing that to `−b` is one integer comparison; each gate compiles to one Verilog `wire` plus one `assign`:
 
 ```verilog
 wire gate_X = ((pos_a + pos_b + ...) >= (neg_c + neg_d + ... + threshold));
 ```
 
-No multipliers, no floating point, no signed arithmetic in the synthesized form. Synthesis tools optimize the popcount sums into adder trees that map directly to LUTs and carry chains.
+No multipliers, no floating point, no signed arithmetic in the synthesized form. Yosys/ABC fold the popcount sums into adder trees that map directly to LUTs and carry chains.
 
-The frontend reads the safetensors file's `signal_registry` metadata (a JSON map from integer signal IDs to symbolic names), uses each gate's `.inputs` tensor to look up its input signals, and emits gates in topologically-sorted order so that every reference is to an already-declared wire. External inputs (signal names starting with `$`) become module ports.
+The frontend reads the safetensors file's `signal_registry` metadata (a JSON map from integer signal IDs to symbolic names), uses each gate's `.inputs` tensor to look up its input signals, and emits gates in topologically-sorted order. External inputs (signal names starting with `$`) become module ports; constant `#0` / `#1` become Verilog literals.
+
+Non-ternary integer weights are kept as integer coefficients in the IR (`k*x` rather than k repetitions of `x`), so an int8-weighted threshold gate compiles to one short sum expression rather than a list of duplicated terms.
+
+## How the bitnet_linear frontend works
+
+BitNet b1.58 represents `nn.Linear` weights as ternary `{-1, 0, 1}`; activations are multi-bit (typically int8). The frontend reads tensors named:
+
+```
+<prefix>.<n>.weight    int / float tensor with shape [out, in], values in {-1, 0, 1}
+<prefix>.<n>.bias      int / float tensor with shape [out] (optional)
+```
+
+For each output neuron, the frontend emits a chain: a `constant` gate carrying the bias as the initial accumulator, then one `add` or `sub` gate per non-zero weight. The accumulator width grows by `ceil(log2(in_features)) + 1` bits per layer to keep the worst-case MAC sum lossless; downstream re-quantization (clamp, register, ROM) is composable in the same IR.
+
+End-to-end smoke: a 3-input → 2-output ternary linear with 4-bit activations, simulated in iverilog, matches Python ground truth on every test case.
+
+## Adding a new frontend
+
+```python
+from safetensors2verilog.core import (
+    Frontend, FrontendOption, Gate, GateGraph, Signal, registry,
+)
+
+
+@registry.register(
+    "my_frontend",
+    description="One-line description that shows in --list-frontends.",
+    metadata_namespace="my_frontend",  # reserved metadata key prefix
+)
+class MyFrontend(Frontend):
+
+    @classmethod
+    def options(cls):
+        return [
+            FrontendOption(
+                name="some-flag",
+                type=int,
+                default=8,
+                help="surfaces as --some-flag on the CLI.",
+            ),
+        ]
+
+    def parse(self, path, top="top", some_flag=8, **opts) -> GateGraph:
+        # Read tensors, build Gate nodes, return GateGraph.
+        gates = [
+            Gate(name="y", kind="add", inputs=["a", "b"],
+                 output_width=8, output_signed=True),
+        ]
+        return GateGraph(
+            inputs=[Signal("a", width=8, signed=True),
+                    Signal("b", width=8, signed=True)],
+            outputs=[Signal("y", width=8, signed=True)],
+            gates=gates,
+            top=top,
+        )
+```
+
+Drop the file under `safetensors2verilog/frontends/`, add a matching `from . import my_frontend` in `frontends/__init__.py`, and the frontend appears in `--list-frontends`.
+
+If your frontend needs a Verilog operation the built-in lowerings don't cover, register one with `@lowering(kind)`:
+
+```python
+from safetensors2verilog.verilog import lowering
+
+
+@lowering("my_op")
+def lower_my_op(ctx, gate):
+    return [f"  assign {ctx.name(gate.name)} = ...;"]
+```
 
 ## Contributing
 
-New frontends are the highest-impact contribution. Pick a model class (BitNet, int8 quantized linear, an ONNX model, anything storable in safetensors) and implement the `Frontend` interface; the backend handles the Verilog plumbing. See `safetensors2verilog/frontends/threshold_logic.py` as a reference.
+New frontends are the highest-impact contribution. The IR supports multi-bit signed arithmetic, parameter ROMs, registers, activations, and threshold logic; if you have a quantization scheme that fits, write a frontend.
 
 ## License
 

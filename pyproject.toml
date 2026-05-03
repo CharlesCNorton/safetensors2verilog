@@ -37,10 +37,12 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=7.0",
+    "numpy>=1.23",  # safetensors.torch.save_file uses numpy under the hood
 ]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "numpy>=1.23",
 ]
 
 [project.scripts]
