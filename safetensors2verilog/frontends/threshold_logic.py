@@ -1,17 +1,19 @@
 """Threshold-logic frontend.
 
-Targets safetensors files whose tensors are named `<gate>.weight`,
-`<gate>.bias`, and (optionally) `<gate>.inputs`, with a JSON metadata
-field `signal_registry` mapping integer signal IDs to symbolic names.
+Targets safetensors files whose tensors are named:
+  <gate>.weight   1-D integer tensor (or packed multi-row [N, K])
+  <gate>.bias     length-1 integer tensor (or length-N for packed)
+  <gate>.inputs   1-D int tensor of signal IDs (optional)
 
-Each gate's `.weight` is a 1-D integer tensor; `.bias` is a length-1
-integer tensor; `.inputs` (when present) is a 1-D int tensor of signal
-IDs whose length matches `.weight`. Signal names beginning with `$`
-are treated as external inputs to the module; `#0` and `#1` are
-constant zero/one wires; all others are gate outputs.
+Plus a JSON metadata field ``signal_registry`` mapping integer signal
+IDs to symbolic names. Names beginning with ``$`` are external module
+inputs; ``#0`` / ``#1`` are constant zero / one wires; all others are
+gate outputs.
+
+Manifest tensors (prefix ``manifest.``) are ignored.
 
 This is the format produced by the 8bit-threshold-computer family at
-https://huggingface.co/phanerozoic/8bit-threshold-computer but the
+https://huggingface.co/phanerozoic/8bit-threshold-computer, but the
 schema is general enough to cover any threshold-gate hierarchical
 network.
 """
@@ -25,58 +27,97 @@ from typing import Dict, List, Set, Tuple
 import torch
 from safetensors import safe_open
 
-from ..core import Frontend, Gate, GateGraph, registry
+from ..core import Frontend, FrontendOption, Gate, GateGraph, Signal, registry
 
 
-def _is_integer_tensor(t: torch.Tensor) -> bool:
+def _is_integer_tensor(t: torch.Tensor, atol: float = 1e-6) -> bool:
+    """Allow rounding error from QAT-exported floats."""
     if not t.dtype.is_floating_point:
         return True
-    return torch.equal(t.float().round(), t.float())
+    tf = t.to(torch.float64)
+    return bool(torch.isclose(tf, tf.round(), atol=atol).all().item())
 
 
 def _is_ternary(t: torch.Tensor) -> bool:
-    """Check whether all values are in {-1, 0, 1}."""
-    tf = t.float()
-    return bool((tf.abs() <= 1.0).all().item()) and _is_integer_tensor(t)
+    if not _is_integer_tensor(t):
+        return False
+    return bool((t.to(torch.float64).abs() <= 1.0).all().item())
 
 
 def _as_int_list(t: torch.Tensor) -> List[int]:
-    return [int(v) for v in t.flatten().tolist()]
+    return [int(round(float(v))) for v in t.flatten().tolist()]
 
 
 @registry.register(
     "threshold_logic",
-    "Threshold-gate networks with named-circuit hierarchy and signal_registry metadata.",
+    description="Threshold-gate networks with named-circuit hierarchy and signal_registry metadata.",
+    metadata_namespace="threshold_logic",
 )
 class ThresholdLogicFrontend(Frontend):
 
-    def parse(self, path: Path, top: str = "top", skip_memory: bool = False, **options) -> GateGraph:
+    @classmethod
+    def options(cls) -> List[FrontendOption]:
+        return [
+            FrontendOption(
+                name="skip-memory",
+                type=bool,
+                default=False,
+                help=(
+                    "drop memory.* gates so they can be served by a vendor BRAM "
+                    "block. Internal references to memory.* signals become external "
+                    "inputs of the resulting CPU core; address / data / write-enable "
+                    "signals appear as external inputs from external code."
+                ),
+            ),
+            FrontendOption(
+                name="strict",
+                type=bool,
+                default=False,
+                help=(
+                    "error out on stale or missing routing metadata instead of "
+                    "promoting affected inputs to anonymous external ports."
+                ),
+            ),
+        ]
+
+    def parse(
+        self,
+        path: Path,
+        top: str = "top",
+        skip_memory: bool = False,
+        strict: bool = False,
+        **options,
+    ) -> GateGraph:
+        # ---- Load tensors and signal registry ----
         tensors: Dict[str, torch.Tensor] = {}
         signal_registry: Dict[int, str] = {}
         with safe_open(str(path), framework="pt") as f:
             meta = f.metadata() or {}
             if "signal_registry" in meta:
                 raw = json.loads(meta["signal_registry"])
-                # Stored as {"0": "#0", "1": "#1", "2": "$a", ...}
                 signal_registry = {int(k): v for k, v in raw.items()}
             for name in f.keys():
                 tensors[name] = f.get_tensor(name).clone()
 
-        # Collect all gate names by stripping known suffixes
+        # ---- Identify gate names ----
         gate_names: Set[str] = set()
         for name in tensors:
             for suffix in (".weight", ".bias", ".inputs"):
                 if name.endswith(suffix):
                     gate_names.add(name[: -len(suffix)])
                     break
-
-        # Manifest tensors are not gates
         gate_names = {g for g in gate_names if not g.startswith("manifest.")}
 
-        # Build a parse-time list of gate descriptors
+        # ---- Walk gates ----
         gates_raw: List[Tuple[str, List[int], List[str], int]] = []
         external_inputs: Set[str] = set()
-        non_ternary_warnings: List[str] = []
+        non_ternary: List[str] = []
+        stats = {
+            "unpacked": 0,
+            "skipped_packed": 0,
+            "stale_routing": 0,
+            "missing_routing": 0,
+        }
 
         for gname in sorted(gate_names):
             w_key = gname + ".weight"
@@ -91,224 +132,257 @@ class ThresholdLogicFrontend(Frontend):
             if not _is_integer_tensor(b):
                 raise ValueError(f"gate '{gname}': bias is not integer-valued")
 
-            # Detect packed multi-gate tensors. The convention is:
-            # bias holds N per-gate biases, weight holds N*K per-gate weights
-            # (concatenated, possibly across additional dims). Unpack into
-            # N gates named "{gname}.bit{i}" with K weights each.
+            # Packed multi-gate path: bias has N entries, weight has N*K entries.
             if b.numel() > 1 and w.numel() % b.numel() == 0:
                 n_gates = b.numel()
                 k = w.numel() // n_gates
                 bias_flat = _as_int_list(b)
                 weight_flat = _as_int_list(w)
-                inputs_flat: List[int] = (
+                inputs_flat = (
                     _as_int_list(tensors[i_key]) if i_key in tensors else []
                 )
-                inputs_per_gate = len(inputs_flat) // n_gates if inputs_flat else 0
-                if inputs_per_gate not in (0, k):
-                    inputs_flat = []  # routing length doesn't match; treat as missing
-                    inputs_per_gate = 0
-                self._unpacked_count = getattr(self, "_unpacked_count", 0) + n_gates
+                inputs_per = (
+                    len(inputs_flat) // n_gates if inputs_flat else 0
+                )
+                if inputs_per not in (0, k):
+                    inputs_flat = []
+                    inputs_per = 0
+                stats["unpacked"] += n_gates
+
                 for i in range(n_gates):
                     sub_name = f"{gname}.bit{i}"
-                    sub_weights = weight_flat[i * k : (i + 1) * k]
-                    sub_bias = bias_flat[i]
-                    if inputs_per_gate:
-                        sub_input_ids = inputs_flat[i * k : (i + 1) * k]
-                        sub_input_names: List[str] = []
-                        for sid in sub_input_ids:
-                            if sid in signal_registry:
-                                sub_input_names.append(signal_registry[sid])
-                            else:
-                                ph = f"_unresolved_{sub_name}_id{sid}"
-                                sub_input_names.append(ph)
-                                external_inputs.add(ph)
+                    sub_w = weight_flat[i * k : (i + 1) * k]
+                    sub_b = bias_flat[i]
+                    if inputs_per:
+                        sub_ids = inputs_flat[i * k : (i + 1) * k]
+                        sub_inputs = self._resolve_ids(
+                            sub_ids, signal_registry, sub_name,
+                            external_inputs, strict,
+                        )
                     else:
-                        sub_input_names = [f"{sub_name}.in{j}" for j in range(k)]
-                        for nm in sub_input_names:
-                            external_inputs.add(nm)
-                        self._missing_routing_count = getattr(self, "_missing_routing_count", 0) + 1
-                    for nm in sub_input_names:
-                        if nm.startswith("$"):
-                            external_inputs.add(nm)
-                    if not all(abs(wv) <= 1 for wv in sub_weights):
-                        non_ternary_warnings.append(sub_name)
-                    gates_raw.append((sub_name, sub_weights, sub_input_names, sub_bias))
+                        sub_inputs = self._anon_inputs(
+                            sub_name, k, external_inputs, strict
+                        )
+                        stats["missing_routing"] += 1
+                    if not all(abs(wv) <= 1 for wv in sub_w):
+                        non_ternary.append(sub_name)
+                    gates_raw.append((sub_name, sub_w, sub_inputs, sub_b))
                 continue
 
-            # Single-gate path: w must be 1-D, b must be a scalar.
             if w.dim() != 1 or b.numel() != 1:
-                self._packed_count = getattr(self, "_packed_count", 0) + 1
+                stats["skipped_packed"] += 1
                 continue
             if not _is_ternary(w):
-                non_ternary_warnings.append(gname)
+                non_ternary.append(gname)
 
             weights = _as_int_list(w)
-            bias = int(b.float().item())
+            bias = int(round(float(b.item())))
 
-            # Resolve input names
-            input_names: List[str]
-            stale_inputs = False
             if i_key in tensors:
                 ids = _as_int_list(tensors[i_key])
                 if len(ids) != len(weights):
-                    # Stale routing: tensor was rebuilt (different fan-in) but
-                    # .inputs wasn't regenerated. Treat as if no routing info.
-                    stale_inputs = True
-                    input_names = [f"{gname}.in{i}" for i in range(len(weights))]
+                    stats["stale_routing"] += 1
+                    inputs = self._anon_inputs(
+                        gname, len(weights), external_inputs, strict
+                    )
                 else:
-                    input_names = []
-                    for sid in ids:
-                        if sid in signal_registry:
-                            input_names.append(signal_registry[sid])
-                        else:
-                            # Unresolved IDs (e.g. -1 placeholders) become
-                            # synthetic external inputs.
-                            placeholder = f"_unresolved_{gname}_id{sid}"
-                            input_names.append(placeholder)
-                            external_inputs.add(placeholder)
+                    inputs = self._resolve_ids(
+                        ids, signal_registry, gname, external_inputs, strict
+                    )
             else:
-                # No routing info; the gate's logical inputs are unknown.
-                input_names = [f"{gname}.in{i}" for i in range(len(weights))]
-                self._missing_routing_count = getattr(self, "_missing_routing_count", 0) + 1
+                stats["missing_routing"] += 1
+                inputs = self._anon_inputs(
+                    gname, len(weights), external_inputs, strict
+                )
 
-            if stale_inputs:
-                self._stale_count = getattr(self, "_stale_count", 0) + 1
+            gates_raw.append((gname, weights, inputs, bias))
 
-            for inp in input_names:
-                if inp.startswith("$"):
-                    external_inputs.add(inp)
-                elif inp.startswith(f"{gname}.in"):
-                    # Anonymous placeholder for a gate without proper routing
-                    # metadata: promote to external so the file is at least
-                    # synthesizable. Caller should regenerate .inputs.
-                    external_inputs.add(inp)
-
-            gates_raw.append((gname, weights, input_names, bias))
-
-        # ----- BRAM carve-out: drop the memory.* gates and let a real
-        # vendor block-RAM serve those reads/writes. The signals that
-        # non-memory gates were consuming from memory.* (read data bits)
-        # become external module inputs, ready to be wired to BRAM
-        # data_out. The signals that memory.* gates consume ($addr,
-        # $data, $we, etc.) are already external and become natural
-        # outputs of the resulting CPU core.
+        # ---- Memory carve-out ----
         if skip_memory:
             mem_prefix = "memory."
-            mem_gate_set = {n for n, *_ in gates_raw if n.startswith(mem_prefix)}
-            promoted: Set[str] = set()
-            for name, _w, inputs, _b in gates_raw:
+            mem_set = {n for n, *_ in gates_raw if n.startswith(mem_prefix)}
+            promoted = 0
+            for name, _w, ins, _b in gates_raw:
                 if name.startswith(mem_prefix):
                     continue
-                for inp in inputs:
-                    if inp in mem_gate_set:
-                        promoted.add(inp)
-                        external_inputs.add(inp)
-            gates_raw = [g for g in gates_raw if not g[0].startswith(mem_prefix)]
-            self._memory_skipped = len(mem_gate_set)
-            self._memory_promoted = len(promoted)
-
+                for src in ins:
+                    if src in mem_set:
+                        external_inputs.add(src)
+                        promoted += 1
+            gates_raw = [
+                g for g in gates_raw if not g[0].startswith(mem_prefix)
+            ]
             referenced: Set[str] = set()
-            for _n, _w, inputs, _b in gates_raw:
-                referenced.update(inputs)
+            for _n, _w, ins, _b in gates_raw:
+                referenced.update(ins)
             external_inputs = {x for x in external_inputs if x in referenced}
+            stats["mem_skipped"] = len(mem_set)
+            stats["mem_promoted"] = promoted
 
-        if non_ternary_warnings:
-            print(
-                f"warning: {len(non_ternary_warnings)} gate(s) have weights "
-                f"outside {{-1, 0, 1}}; the backend handles them but the "
-                f"generated RTL will use larger adder trees for those gates. "
-                f"First few: {non_ternary_warnings[:5]}"
+        # ---- Diagnostics ----
+        self._print_warnings(non_ternary, stats)
+
+        # ---- Topological sort (iterative; tolerates deep chains) ----
+        sorted_raw = self._topo_sort(gates_raw)
+
+        # ---- Build Gate IR ----
+        gates: List[Gate] = [
+            Gate(
+                name=name,
+                kind="threshold",
+                inputs=inputs,
+                attrs={"weights": weights, "bias": bias},
+                output_width=1,
+                output_signed=False,
             )
-        if getattr(self, "_memory_skipped", 0):
-            print(
-                f"info: skipped {self._memory_skipped} memory.* gate(s); "
-                f"{self._memory_promoted} read-side signal(s) promoted to "
-                f"external inputs. Wire them to a vendor BRAM block."
-            )
-        if getattr(self, "_stale_count", 0):
-            print(
-                f"warning: {self._stale_count} gate(s) have stale .inputs "
-                f"metadata (length mismatch with .weight); their inputs "
-                f"have been promoted to external module ports. Regenerate "
-                f"the file's .inputs metadata for accurate routing."
-            )
-        if getattr(self, "_unpacked_count", 0):
-            print(
-                f"info: unpacked {self._unpacked_count} sub-gate(s) from "
-                f"packed tensors (one bias per row, weights concatenated)."
-            )
-        if getattr(self, "_packed_count", 0):
-            print(
-                f"warning: skipped {self._packed_count} packed tensor(s) "
-                f"with non-rectangular layout (weight/bias size mismatch)."
-            )
+            for name, weights, inputs, bias in sorted_raw
+        ]
 
-        # Topological sort
-        gate_set = {name for name, *_ in gates_raw}
-        deps: Dict[str, Set[str]] = {}
-        for gname, _w, inputs, _b in gates_raw:
-            deps[gname] = {inp for inp in inputs if inp in gate_set}
-
-        sorted_names: List[str] = []
-        marked: Set[str] = set()
-        in_progress: Set[str] = set()
-
-        def visit(node: str) -> None:
-            if node in marked:
-                return
-            if node in in_progress:
-                raise ValueError(
-                    f"cycle detected in gate dependency graph involving '{node}'"
-                )
-            in_progress.add(node)
-            for dep in deps.get(node, ()):
-                visit(dep)
-            in_progress.discard(node)
-            marked.add(node)
-            sorted_names.append(node)
-
-        gate_by_name = {name: (w, inputs, bias) for name, w, inputs, bias in gates_raw}
-        for name, *_ in gates_raw:
-            visit(name)
-
-        # Translate to Gate dataclasses
-        gates: List[Gate] = []
-        for name in sorted_names:
-            w, inputs, bias = gate_by_name[name]
-            pos: List[str] = []
-            neg: List[str] = []
-            for weight, src in zip(w, inputs):
-                if weight > 0:
-                    for _ in range(weight):
-                        pos.append(src)
-                elif weight < 0:
-                    for _ in range(-weight):
-                        neg.append(src)
-                # weight == 0: drop the connection
-            gates.append(Gate(name=name, pos=pos, neg=neg, bias=bias))
-
-        # Outputs: gates that aren't anyone's input
-        used: Set[str] = set()
+        consumed: Set[str] = set()
+        produced: Set[str] = set()
         for g in gates:
-            for src in g.pos + g.neg:
-                used.add(src)
-        outputs = sorted(g.name for g in gates if g.name not in used)
+            produced.add(g.name)
+            for s in g.inputs:
+                consumed.add(s)
+        output_names = sorted(g.name for g in gates if g.name not in consumed)
 
-        # External inputs: anything referenced but not produced by any gate.
-        # Constants `#0` / `#1` are handled as Verilog literals, not ports.
-        produced = {g.name for g in gates}
         for g in gates:
-            for src in g.pos + g.neg:
-                if src in ("#0", "#1"):
+            for s in g.inputs:
+                if s in ("#0", "#1"):
                     continue
-                if src not in produced:
-                    external_inputs.add(src)
+                if s not in produced:
+                    external_inputs.add(s)
 
-        inputs_list = sorted(external_inputs)
+        input_signals = [
+            Signal(name=n, width=1, signed=False)
+            for n in sorted(external_inputs)
+        ]
+        output_signals = [
+            Signal(name=n, width=1, signed=False) for n in output_names
+        ]
 
         return GateGraph(
-            inputs=inputs_list,
-            outputs=outputs,
+            inputs=input_signals,
+            outputs=output_signals,
             gates=gates,
             top=top,
         )
+
+    # ---- Helpers ----
+
+    @staticmethod
+    def _resolve_ids(
+        ids: List[int],
+        reg: Dict[int, str],
+        gname: str,
+        external: Set[str],
+        strict: bool,
+    ) -> List[str]:
+        names: List[str] = []
+        for sid in ids:
+            if sid in reg:
+                nm = reg[sid]
+            else:
+                if strict:
+                    raise ValueError(
+                        f"gate '{gname}' references unresolved signal id {sid}"
+                    )
+                nm = f"_unresolved_{gname}_id{sid}"
+                external.add(nm)
+            if nm.startswith("$"):
+                external.add(nm)
+            names.append(nm)
+        return names
+
+    @staticmethod
+    def _anon_inputs(
+        gname: str, n: int, external: Set[str], strict: bool
+    ) -> List[str]:
+        if strict:
+            raise ValueError(
+                f"gate '{gname}' has missing or stale routing metadata "
+                f"(use strict=False to promote to anonymous external inputs)"
+            )
+        names = [f"{gname}.in{i}" for i in range(n)]
+        for nm in names:
+            external.add(nm)
+        return names
+
+    @staticmethod
+    def _print_warnings(non_ternary: List[str], stats: Dict[str, int]) -> None:
+        if non_ternary:
+            print(
+                f"warning: {len(non_ternary)} gate(s) have non-ternary weights; "
+                f"the IR carries them as integer weights (kind='threshold' with "
+                f"weights:list[int]). Synthesis lowers k*x as a constant-coefficient "
+                f"multiplier. First few: {non_ternary[:5]}"
+            )
+        if stats.get("unpacked"):
+            print(
+                f"info: unpacked {stats['unpacked']} sub-gate(s) from packed tensors."
+            )
+        if stats.get("skipped_packed"):
+            print(
+                f"warning: skipped {stats['skipped_packed']} packed tensor(s) "
+                f"with non-rectangular layout."
+            )
+        if stats.get("stale_routing"):
+            print(
+                f"warning: {stats['stale_routing']} gate(s) had .inputs metadata "
+                f"out of sync with .weight; their inputs were promoted to anonymous "
+                f"external ports. Regenerate the safetensors' routing metadata."
+            )
+        if stats.get("missing_routing"):
+            print(
+                f"warning: {stats['missing_routing']} gate(s) had no .inputs "
+                f"metadata; their inputs were promoted to anonymous external ports."
+            )
+        if stats.get("mem_skipped"):
+            print(
+                f"info: skipped {stats['mem_skipped']} memory.* gate(s); "
+                f"{stats.get('mem_promoted', 0)} read-side reference(s) were "
+                f"promoted to external inputs. Wire them to a vendor BRAM block "
+                f"(use --emit-bram-template to get a starter module)."
+            )
+
+    @staticmethod
+    def _topo_sort(
+        gates_raw: List[Tuple[str, List[int], List[str], int]],
+    ) -> List[Tuple[str, List[int], List[str], int]]:
+        """Iterative DFS so very deep gate chains do not hit Python's recursion limit."""
+        gate_set = {name for name, *_ in gates_raw}
+        gate_by_name = {name: (w, ins, b) for name, w, ins, b in gates_raw}
+        deps: Dict[str, List[str]] = {
+            name: [s for s in ins if s in gate_set]
+            for name, _w, ins, _b in gates_raw
+        }
+
+        order: List[str] = []
+        marked: Set[str] = set()
+        in_progress: Set[str] = set()
+
+        for start in [name for name, *_ in gates_raw]:
+            if start in marked:
+                continue
+            stack: List[Tuple[str, bool]] = [(start, False)]
+            while stack:
+                node, visited = stack.pop()
+                if visited:
+                    in_progress.discard(node)
+                    if node not in marked:
+                        marked.add(node)
+                        order.append(node)
+                    continue
+                if node in marked:
+                    continue
+                if node in in_progress:
+                    raise ValueError(
+                        f"cycle detected in gate graph involving '{node}'"
+                    )
+                in_progress.add(node)
+                stack.append((node, True))
+                for dep in deps.get(node, ()):
+                    if dep not in marked:
+                        stack.append((dep, False))
+
+        return [(name, *gate_by_name[name]) for name in order]

@@ -1,10 +1,33 @@
-"""safetensors2verilog: compile safetensors-stored networks to synthesis-ready Verilog."""
+"""safetensors2verilog: compile safetensors networks to synthesis-ready Verilog."""
 
-from .core import Frontend, Gate, GateGraph, registry
-from .verilog import emit_module, emit_bram_template
+from .core import (
+    Frontend,
+    FrontendOption,
+    Gate,
+    GateGraph,
+    Signal,
+    registry,
+)
+from .verilog import (
+    emit_bram_template,
+    emit_module,
+    lowering,
+    registered_kinds,
+)
 
 # Importing each frontend module registers it via the registry decorator.
-from .frontends import threshold_logic  # noqa: F401
+from . import frontends  # noqa: F401
 
-__all__ = ["Frontend", "Gate", "GateGraph", "registry", "emit_module", "emit_bram_template"]
-__version__ = "0.1.0"
+__all__ = [
+    "Frontend",
+    "FrontendOption",
+    "Gate",
+    "GateGraph",
+    "Signal",
+    "registry",
+    "emit_module",
+    "emit_bram_template",
+    "lowering",
+    "registered_kinds",
+]
+__version__ = "0.2.0"
