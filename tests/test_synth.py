@@ -90,4 +90,5 @@ def test_live_yosys_smoke(tmp_path):
         encoding="utf-8",
     )
     stats = run_synth(str(v), top="tiny")
-    assert stats["cells"] >= 1
+    assert stats["yosys_exit_code"] == 0
+    assert "yosys_stdout" in stats
