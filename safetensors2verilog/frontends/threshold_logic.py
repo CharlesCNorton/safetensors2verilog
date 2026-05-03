@@ -90,7 +90,52 @@ class ThresholdLogicFrontend(Frontend):
                 raise ValueError(f"gate '{gname}': weights are not integer-valued")
             if not _is_integer_tensor(b):
                 raise ValueError(f"gate '{gname}': bias is not integer-valued")
-            # Skip packed multi-gate tensors: weight shape != [N] or bias != [1]/scalar
+
+            # Detect packed multi-gate tensors. The convention is:
+            # bias holds N per-gate biases, weight holds N*K per-gate weights
+            # (concatenated, possibly across additional dims). Unpack into
+            # N gates named "{gname}.bit{i}" with K weights each.
+            if b.numel() > 1 and w.numel() % b.numel() == 0:
+                n_gates = b.numel()
+                k = w.numel() // n_gates
+                bias_flat = _as_int_list(b)
+                weight_flat = _as_int_list(w)
+                inputs_flat: List[int] = (
+                    _as_int_list(tensors[i_key]) if i_key in tensors else []
+                )
+                inputs_per_gate = len(inputs_flat) // n_gates if inputs_flat else 0
+                if inputs_per_gate not in (0, k):
+                    inputs_flat = []  # routing length doesn't match; treat as missing
+                    inputs_per_gate = 0
+                self._unpacked_count = getattr(self, "_unpacked_count", 0) + n_gates
+                for i in range(n_gates):
+                    sub_name = f"{gname}.bit{i}"
+                    sub_weights = weight_flat[i * k : (i + 1) * k]
+                    sub_bias = bias_flat[i]
+                    if inputs_per_gate:
+                        sub_input_ids = inputs_flat[i * k : (i + 1) * k]
+                        sub_input_names: List[str] = []
+                        for sid in sub_input_ids:
+                            if sid in signal_registry:
+                                sub_input_names.append(signal_registry[sid])
+                            else:
+                                ph = f"_unresolved_{sub_name}_id{sid}"
+                                sub_input_names.append(ph)
+                                external_inputs.add(ph)
+                    else:
+                        sub_input_names = [f"{sub_name}.in{j}" for j in range(k)]
+                        for nm in sub_input_names:
+                            external_inputs.add(nm)
+                        self._missing_routing_count = getattr(self, "_missing_routing_count", 0) + 1
+                    for nm in sub_input_names:
+                        if nm.startswith("$"):
+                            external_inputs.add(nm)
+                    if not all(abs(wv) <= 1 for wv in sub_weights):
+                        non_ternary_warnings.append(sub_name)
+                    gates_raw.append((sub_name, sub_weights, sub_input_names, sub_bias))
+                continue
+
+            # Single-gate path: w must be 1-D, b must be a scalar.
             if w.dim() != 1 or b.numel() != 1:
                 self._packed_count = getattr(self, "_packed_count", 0) + 1
                 continue
@@ -154,11 +199,15 @@ class ThresholdLogicFrontend(Frontend):
                 f"have been promoted to external module ports. Regenerate "
                 f"the file's .inputs metadata for accurate routing."
             )
+        if getattr(self, "_unpacked_count", 0):
+            print(
+                f"info: unpacked {self._unpacked_count} sub-gate(s) from "
+                f"packed tensors (one bias per row, weights concatenated)."
+            )
         if getattr(self, "_packed_count", 0):
             print(
-                f"warning: skipped {self._packed_count} packed gate(s) "
-                f"(multi-dimensional weight or non-scalar bias); the "
-                f"v0.1 frontend handles only one gate per tensor pair."
+                f"warning: skipped {self._packed_count} packed tensor(s) "
+                f"with non-rectangular layout (weight/bias size mismatch)."
             )
 
         # Topological sort
