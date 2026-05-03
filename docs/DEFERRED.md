@@ -34,11 +34,50 @@ The path forward for any of these is the same: pick a fixed-point format, add th
 
 ## Sequential bitnet feature gaps
 
-`bitnet_linear --sequential` ships with a fixed parallelism (one MAC per output, parallel across all outputs of the active layer). The list below is what's needed to scale to LLM-size layers:
+`bitnet_linear --sequential` ships with a fixed parallelism: one MAC per output neuron, with all out_size MACs running in parallel during a layer's compute phase. Latency is `sum(in_sizes)` cycles per inference. Below is what each feature would entail and the natural extension path.
 
-- `--parallelism N`: time-multiplex outputs to trade latency for area. Doable: add an output-iterator counter alongside the input counter.
-- `--streaming-input`: replace the `x[0..N-1]` port bank with a single input bus and a `valid_in` strobe. Doable but the protocol design (whether to buffer, whether to gate on `ready_out`) matters.
-- `--handshake`: full Ready/Valid streaming protocol for both ends of the pipeline.
-- `--weight-bram`: replace the per-output ROM with a writable BRAM, exposing a write port for runtime weight reload. Doable; needs a separate `bram` IR kind (or extending the `rom` kind to optionally accept write inputs).
+### `--parallelism N`: time-multiplex outputs
 
-These are substantial features; each warrants its own change with careful protocol thought. Not needed for small networks where the current parallel-MAC sequential mode works fine.
+Trade latency for area. Default behavior corresponds to `N = out_size[L]`. With `N < out_size[L]`, the layer reuses N MAC units to compute groups of N outputs at a time, looping `ceil(out_size[L] / N)` times before advancing to the next layer.
+
+Architecture changes:
+- Add an `output_group` register: 0..ceil(out_size[L]/N)-1 per layer.
+- Per-layer ROM is addressed by `(output_group * N * in_size[L] + local_j * in_size[L] + counter)`, i.e. a flat row-major store of all out_size[L] * in_size[L] weights, with the per-MAC offset selected by `local_j` (0..N-1) and the per-cycle position by `counter`.
+- Accumulator file: out_size[L] registers, but only the N corresponding to the current output_group update each cycle.
+- FSM: a third counter wraps `output_group` once `counter == in_size[L]-1`; layer transitions when `output_group == ceil(out_size[L]/N)-1` and `counter == in_size[L]-1`.
+
+Latency: `sum(in_sizes[L] * ceil(out_sizes[L]/N))`. Area: roughly N MAC units per layer.
+
+### `--streaming-input`: single port + valid strobe
+
+Replace the `x[0..N0-1]` port bank with a single `x` data bus, a `valid_in` strobe, and a `ready_out` backpressure signal.
+
+Architecture changes:
+- Replace the bank of input ports with one `x` port of activation_bits.
+- Add a per-input register file (`in_buf[0..N0-1]`) that fills from `x` each cycle that `valid_in && ready_out`.
+- The FSM stays in IDLE while `in_buf` is being filled; transitions to COMPUTE only when all inputs have arrived.
+- For non-blocking operation, `ready_out` should reflect whether the pipeline can accept the next input (true while filling `in_buf` or while DONE; false during COMPUTE).
+
+This protocol has flavors. The simplest is "fill all inputs, then compute, then drain" (latency = N + sum(in_sizes) + out_size). A more elaborate version pipelines the input fill with a previous inference's compute.
+
+### `--handshake`: full ready/valid output protocol
+
+Add `valid_out` and `ready_in` to the output side. The DONE state holds outputs valid until `ready_in` is asserted, then transitions back to IDLE. With both `--streaming-input` and `--handshake`, the module looks like a standard AXI-Stream-shaped block.
+
+Architecture: a 4-state FSM (IDLE / FILLING / COMPUTING / VALID_WAITING). Output buffer registers hold final values across the VALID_WAITING state until `ready_in` fires.
+
+### `--weight-bram`: runtime-loadable weights
+
+Replace the per-output ROM with a writable BRAM, so the host can reload weights after synthesis (e.g. for fine-tuning or model swap).
+
+Architecture changes:
+- Add a `bram` IR kind: like `rom` but with `inputs = [read_addr, write_addr, write_data, write_en, clk]` and a synchronous write path. Or extend `rom` with optional write attributes.
+- In `--weight-bram` mode, expose `weight_addr`, `weight_data`, `weight_we` as external module ports.
+- ROM init becomes optional (zeros at reset), or kept as default values that can be overwritten.
+- The user is responsible for loading weights before asserting `start`.
+
+The Verilog template would mirror the existing `emit_bram_template`: synchronous single-port BRAM with vendor-friendly inference, plus a small write address mux that selects between layers.
+
+---
+
+All four are designed but not built. The current parallel-MAC sequential mode is the right default for small networks (sub-thousand-weight layers). For LLM-scale layers, `--parallelism 1` is the most needed of the four; the rest matter only when integrating into a streaming SoC.
