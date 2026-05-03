@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
 
 import torch
 from safetensors import safe_open
@@ -44,7 +43,7 @@ def _is_ternary(t: torch.Tensor) -> bool:
     return bool((t.to(torch.float64).abs() <= 1.0).all().item())
 
 
-def _as_int_list(t: torch.Tensor) -> List[int]:
+def _as_int_list(t: torch.Tensor) -> list[int]:
     return [int(round(float(v))) for v in t.flatten().tolist()]
 
 
@@ -56,7 +55,7 @@ def _as_int_list(t: torch.Tensor) -> List[int]:
 class ThresholdLogicFrontend(Frontend):
 
     @classmethod
-    def options(cls) -> List[FrontendOption]:
+    def options(cls) -> list[FrontendOption]:
         return [
             FrontendOption(
                 name="skip-memory",
@@ -89,8 +88,8 @@ class ThresholdLogicFrontend(Frontend):
         **options,
     ) -> GateGraph:
         # ---- Load tensors and signal registry ----
-        tensors: Dict[str, torch.Tensor] = {}
-        signal_registry: Dict[int, str] = {}
+        tensors: dict[str, torch.Tensor] = {}
+        signal_registry: dict[int, str] = {}
         with safe_open(str(path), framework="pt") as f:
             meta = f.metadata() or {}
             if "signal_registry" in meta:
@@ -100,7 +99,7 @@ class ThresholdLogicFrontend(Frontend):
                 tensors[name] = f.get_tensor(name).clone()
 
         # ---- Identify gate names ----
-        gate_names: Set[str] = set()
+        gate_names: set[str] = set()
         for name in tensors:
             for suffix in (".weight", ".bias", ".inputs"):
                 if name.endswith(suffix):
@@ -109,9 +108,9 @@ class ThresholdLogicFrontend(Frontend):
         gate_names = {g for g in gate_names if not g.startswith("manifest.")}
 
         # ---- Walk gates ----
-        gates_raw: List[Tuple[str, List[int], List[str], int]] = []
-        external_inputs: Set[str] = set()
-        non_ternary: List[str] = []
+        gates_raw: list[tuple[str, list[int], list[str], int]] = []
+        external_inputs: set[str] = set()
+        non_ternary: list[str] = []
         stats = {
             "unpacked": 0,
             "skipped_packed": 0,
@@ -212,7 +211,7 @@ class ThresholdLogicFrontend(Frontend):
             gates_raw = [
                 g for g in gates_raw if not g[0].startswith(mem_prefix)
             ]
-            referenced: Set[str] = set()
+            referenced: set[str] = set()
             for _n, _w, ins, _b in gates_raw:
                 referenced.update(ins)
             external_inputs = {x for x in external_inputs if x in referenced}
@@ -226,7 +225,7 @@ class ThresholdLogicFrontend(Frontend):
         sorted_raw = self._topo_sort(gates_raw)
 
         # ---- Build Gate IR ----
-        gates: List[Gate] = [
+        gates: list[Gate] = [
             Gate(
                 name=name,
                 kind="threshold",
@@ -238,8 +237,8 @@ class ThresholdLogicFrontend(Frontend):
             for name, weights, inputs, bias in sorted_raw
         ]
 
-        consumed: Set[str] = set()
-        produced: Set[str] = set()
+        consumed: set[str] = set()
+        produced: set[str] = set()
         for g in gates:
             produced.add(g.name)
             for s in g.inputs:
@@ -272,13 +271,13 @@ class ThresholdLogicFrontend(Frontend):
 
     @staticmethod
     def _resolve_ids(
-        ids: List[int],
-        reg: Dict[int, str],
+        ids: list[int],
+        reg: dict[int, str],
         gname: str,
-        external: Set[str],
+        external: set[str],
         strict: bool,
-    ) -> List[str]:
-        names: List[str] = []
+    ) -> list[str]:
+        names: list[str] = []
         for sid in ids:
             if sid in reg:
                 nm = reg[sid]
@@ -296,8 +295,8 @@ class ThresholdLogicFrontend(Frontend):
 
     @staticmethod
     def _anon_inputs(
-        gname: str, n: int, external: Set[str], strict: bool
-    ) -> List[str]:
+        gname: str, n: int, external: set[str], strict: bool
+    ) -> list[str]:
         if strict:
             raise ValueError(
                 f"gate '{gname}' has missing or stale routing metadata "
@@ -309,7 +308,7 @@ class ThresholdLogicFrontend(Frontend):
         return names
 
     @staticmethod
-    def _print_warnings(non_ternary: List[str], stats: Dict[str, int]) -> None:
+    def _print_warnings(non_ternary: list[str], stats: dict[str, int]) -> None:
         if non_ternary:
             print(
                 f"warning: {len(non_ternary)} gate(s) have non-ternary weights; "
@@ -347,24 +346,24 @@ class ThresholdLogicFrontend(Frontend):
 
     @staticmethod
     def _topo_sort(
-        gates_raw: List[Tuple[str, List[int], List[str], int]],
-    ) -> List[Tuple[str, List[int], List[str], int]]:
+        gates_raw: list[tuple[str, list[int], list[str], int]],
+    ) -> list[tuple[str, list[int], list[str], int]]:
         """Iterative DFS so very deep gate chains do not hit Python's recursion limit."""
         gate_set = {name for name, *_ in gates_raw}
         gate_by_name = {name: (w, ins, b) for name, w, ins, b in gates_raw}
-        deps: Dict[str, List[str]] = {
+        deps: dict[str, list[str]] = {
             name: [s for s in ins if s in gate_set]
             for name, _w, ins, _b in gates_raw
         }
 
-        order: List[str] = []
-        marked: Set[str] = set()
-        in_progress: Set[str] = set()
+        order: list[str] = []
+        marked: set[str] = set()
+        in_progress: set[str] = set()
 
         for start in [name for name, *_ in gates_raw]:
             if start in marked:
                 continue
-            stack: List[Tuple[str, bool]] = [(start, False)]
+            stack: list[tuple[str, bool]] = [(start, False)]
             while stack:
                 node, visited = stack.pop()
                 if visited:

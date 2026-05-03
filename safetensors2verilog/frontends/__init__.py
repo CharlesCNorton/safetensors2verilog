@@ -6,5 +6,9 @@ To add a new frontend:
   3. Add `from . import my_frontend` to this file.
 """
 
-from . import threshold_logic  # noqa: F401
-from . import bitnet_linear  # noqa: F401
+from . import (
+    bitnet_linear,  # noqa: F401
+    int8_linear,  # noqa: F401
+    onnx_topology,  # noqa: F401
+    threshold_logic,  # noqa: F401
+)

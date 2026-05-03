@@ -37,12 +37,19 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=7.0",
+    "pytest-cov>=4.0",
     "numpy>=1.23",  # safetensors.torch.save_file uses numpy under the hood
 ]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "numpy>=1.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "onnx>=1.14",
+]
+onnx = [
+    "onnx>=1.14",
 ]
 
 [project.scripts]
@@ -57,3 +64,23 @@ include = ["safetensors2verilog*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # line length is enforced loosely
+    "E741",  # ambiguous-name; we use 'l' for lines in test parsing
+    "B008",  # default arg call (we don't have those)
+    "B905",  # zip() without strict=; lengths are explicitly validated upstream
+]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true

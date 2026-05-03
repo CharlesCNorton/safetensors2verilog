@@ -19,9 +19,9 @@ The tool is structured as a small intermediate representation with a pluggable f
 | Frontend | Status | Notes |
 |----------|--------|-------|
 | `threshold_logic` | working | Threshold-gate networks with named-circuit hierarchy and a `signal_registry` metadata map. Ternary weights become direct-sum comparisons; integer weights become constant-coefficient sums (`k*x`). Tested against the [8bit-threshold-computer](https://huggingface.co/phanerozoic/8bit-threshold-computer) family. |
-| `bitnet_linear` | working | BitNet b1.58-style ternary linear layers; multi-bit signed activations. Reads state-dict-style tensor layout (`<prefix>.<n>.weight`, optional `<prefix>.<n>.bias`). Emits per-output MAC chains as add/sub/constant gates over signed buses, with the accumulator widening per layer. |
-| `int8_linear` | planned | Standard quantized `nn.Linear` with int8 weights. The IR already supports the necessary multi-bit signed arithmetic; the frontend itself is not yet written. |
-| `onnx_topology` | planned | Use an ONNX file to describe the dataflow, fetch weights from safetensors. |
+| `bitnet_linear` | working | BitNet b1.58-style ternary linear layers with multi-bit signed activations. Reads state-dict-style tensor layout (`<prefix>.<n>.weight`, optional `<prefix>.<n>.bias`). Emits one `linear` gate per output neuron over signed buses; supports `--output-clamp LO,HI` for per-layer saturation and `--pipeline` for registered outputs. |
+| `int8_linear` | working | Quantized linear layers with arbitrary signed integer weights. Same shape as `bitnet_linear` but accepts any integers within `--weight-bits`; same `--output-clamp` and `--pipeline` options. |
+| `onnx_topology` | working (subset) | ONNX file gives the topology, safetensors gives weights. Supported ops: `Gemm`, `MatMul`, `Add`, `Sub`, `Mul`, `Relu`, `Identity`, `Constant`. Anything else raises `NotImplementedError` naming the op. Requires `pip install -e .[onnx]`. |
 
 Adding a new frontend means subclassing `Frontend` and implementing `parse(path) -> GateGraph`. Operations are expressed as `Gate(kind, inputs, attrs, output_width, output_signed)`. The Verilog backend handles signal sanitization, port emission, topological-order validation, and per-kind lowering. See `safetensors2verilog/frontends/threshold_logic.py` and `bitnet_linear.py` as references.
 
@@ -74,21 +74,54 @@ python -m safetensors2verilog cpu.safetensors \
 # promoting affected inputs to anonymous external ports
 python -m safetensors2verilog cpu.safetensors --strict -o cpu.v
 
-# bitnet_linear: 4-bit signed activations, custom layer prefix
+# bitnet_linear: 4-bit signed activations, per-layer saturating clamp,
+# pipelined output (one cycle of latency per layer)
 python -m safetensors2verilog model.safetensors \
     --frontend bitnet_linear \
     --activation-bits 4 \
+    --output-clamp -8,7 \
+    --pipeline \
+    -o model.v
+
+# int8_linear: 8-bit weights, 4-bit activations, custom layer prefix
+python -m safetensors2verilog model.safetensors \
+    --frontend int8_linear \
+    --weight-bits 8 \
+    --activation-bits 4 \
     --layer-prefix backbone.linear \
+    -o model.v
+
+# onnx_topology: ONNX file gives the graph, safetensors gives weights
+python -m safetensors2verilog weights.safetensors \
+    --frontend onnx_topology \
+    --onnx model.onnx \
+    --activation-bits 8 --weight-bits 8 \
     -o model.v
 ```
 
-## Worked example
-
-`examples/threshold_alu/run.py` builds a small threshold-network half-adder, converts it to Verilog, simulates with Icarus Verilog, and cross-checks the simulator output against a Python evaluation of the same network. It runs as part of CI.
+### Other CLI flags
 
 ```bash
-python examples/threshold_alu/run.py
+# Inspect what a frontend produces, without emitting Verilog
+python -m safetensors2verilog input.safetensors --emit-ir json -o ir.json
+
+# Validate that a frontend accepts the input but emit nothing
+python -m safetensors2verilog input.safetensors --dry-run
+
+# Suppress progress messages on stderr
+python -m safetensors2verilog input.safetensors -o out.v --quiet
 ```
+
+## Worked examples
+
+Two example scripts run end-to-end (build → convert → simulate → cross-check) and are part of CI:
+
+```bash
+python examples/threshold_alu/run.py     # threshold-network half-adder
+python examples/bitnet_linear/run.py     # 3-input -> 2-output ternary linear
+```
+
+Both build a small safetensors fixture, convert it through the appropriate frontend, simulate the resulting Verilog with Icarus Verilog over a sweep of input combinations, and cross-check the simulator output against a Python evaluator of the same network.
 
 ## How the threshold-logic frontend works
 

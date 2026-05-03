@@ -15,18 +15,44 @@ To list a frontend's specific flags:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
-from typing import List, Optional
 
 # Importing this submodule has the side effect of registering frontends.
 from . import frontends  # noqa: F401
-from .core import FrontendOption, registry
+from .core import FrontendOption, GateGraph, registry
 from .verilog import emit_bram_template, emit_module
 
 
+def _graph_to_jsonable(graph: GateGraph) -> dict:
+    """Render a GateGraph as a plain dict for --emit-ir json output."""
+    return {
+        "top": graph.top,
+        "inputs": [
+            {"name": s.name, "width": s.width, "signed": s.signed}
+            for s in graph.inputs
+        ],
+        "outputs": [
+            {"name": s.name, "width": s.width, "signed": s.signed}
+            for s in graph.outputs
+        ],
+        "gates": [
+            {
+                "name": g.name,
+                "kind": g.kind,
+                "inputs": list(g.inputs),
+                "attrs": g.attrs,
+                "output_width": g.output_width,
+                "output_signed": g.output_signed,
+            }
+            for g in graph.gates
+        ],
+    }
+
+
 def _add_frontend_options(
-    parser: argparse.ArgumentParser, opts: List[FrontendOption]
+    parser: argparse.ArgumentParser, opts: list[FrontendOption]
 ) -> None:
     for opt in opts:
         flag = "--" + opt.name
@@ -48,7 +74,7 @@ def _format_option_default(opt: FrontendOption) -> str:
     return f"{opt.type.__name__} (default: {opt.default!r})"
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="safetensors2verilog",
         description="Compile safetensors-stored networks to synthesis-ready Verilog.",
@@ -93,6 +119,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--bram-data-bits", type=int, default=8,
         help="data width for --emit-bram-template (default: 8)",
+    )
+    parser.add_argument(
+        "--emit-ir", choices=["json"], default=None,
+        help=(
+            "instead of (or alongside) Verilog, dump the IR as JSON. "
+            "Goes to --output if set, otherwise stdout."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "parse and validate the input but emit nothing. Useful for "
+            "checking that a frontend accepts a given safetensors file."
+        ),
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="suppress progress messages on stderr.",
     )
 
     # Two-pass parsing: pull out the frontend name first, then add its
@@ -144,17 +188,31 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     frontend = frontend_cls()
     graph = frontend.parse(args.input, top=args.top, **fe_kwargs)
-    text = emit_module(graph)
+
+    def _info(msg: str) -> None:
+        if not args.quiet:
+            print(msg, file=sys.stderr)
+
+    if args.dry_run:
+        _info(
+            f"dry-run: {len(graph.gates)} gates, {len(graph.inputs)} inputs, "
+            f"{len(graph.outputs)} outputs"
+        )
+        return 0
+
+    if args.emit_ir == "json":
+        text = json.dumps(_graph_to_jsonable(graph), indent=2)
+    else:
+        text = emit_module(graph)
 
     if args.output is None:
         sys.stdout.write(text)
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text, encoding="utf-8")
-        print(
+        _info(
             f"wrote {args.output} ({len(graph.gates)} gates, "
-            f"{len(graph.inputs)} inputs, {len(graph.outputs)} outputs)",
-            file=sys.stderr,
+            f"{len(graph.inputs)} inputs, {len(graph.outputs)} outputs)"
         )
 
     if args.emit_bram_template is not None:
@@ -167,20 +225,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if "manifest.addr_bits" in f.keys():
                         addr_bits = int(f.get_tensor("manifest.addr_bits").item())
             except Exception as e:  # pragma: no cover - non-critical fallback
-                print(
+                _info(
                     f"warning: could not read manifest.addr_bits "
-                    f"({type(e).__name__}: {e}); using default 16",
-                    file=sys.stderr,
+                    f"({type(e).__name__}: {e}); using default 16"
                 )
         bram_text = emit_bram_template(
             addr_bits=addr_bits, data_bits=args.bram_data_bits
         )
         args.emit_bram_template.parent.mkdir(parents=True, exist_ok=True)
         args.emit_bram_template.write_text(bram_text, encoding="utf-8")
-        print(
+        _info(
             f"wrote {args.emit_bram_template} (BRAM template, "
-            f"{addr_bits}-bit addr, {args.bram_data_bits}-bit data)",
-            file=sys.stderr,
+            f"{addr_bits}-bit addr, {args.bram_data_bits}-bit data)"
         )
 
     return 0

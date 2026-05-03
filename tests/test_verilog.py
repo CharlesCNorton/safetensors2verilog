@@ -14,7 +14,6 @@ from safetensors2verilog.verilog import (
     registered_kinds,
 )
 
-
 # ---- Module name validation -------------------------------------------------
 
 
@@ -246,3 +245,274 @@ def test_bram_template_validates_widths():
         emit_bram_template(addr_bits=64)
     with pytest.raises(ValueError):
         emit_bram_template(data_bits=0)
+
+
+# ---- Shifts -----------------------------------------------------------------
+
+
+def test_shift_left_emits_correct_operator():
+    g = GateGraph(
+        inputs=[Signal("x", width=8)],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="shift_left", inputs=["x"],
+                    attrs={"amount": 3}, output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "x << 3" in text
+
+
+def test_shift_right_unsigned_emits_logical_shift():
+    g = GateGraph(
+        inputs=[Signal("x", width=8)],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="shift_right", inputs=["x"],
+                    attrs={"amount": 2}, output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert ">> 2" in text and ">>>" not in text
+
+
+def test_shift_right_signed_emits_arithmetic_shift():
+    g = GateGraph(
+        inputs=[Signal("x", width=8, signed=True)],
+        outputs=[Signal("y", width=8, signed=True)],
+        gates=[Gate(name="y", kind="shift_right", inputs=["x"],
+                    attrs={"amount": 1},
+                    output_width=8, output_signed=True)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert ">>> 1" in text
+    assert "$signed(x)" in text
+
+
+# ---- Multi-way mux ----------------------------------------------------------
+
+
+def test_multi_way_mux_emits_chained_ternary():
+    g = GateGraph(
+        inputs=[Signal("sel", width=2),
+                Signal("a", width=4), Signal("b", width=4),
+                Signal("c", width=4), Signal("d", width=4)],
+        outputs=[Signal("y", width=4)],
+        gates=[Gate(name="y", kind="mux",
+                    inputs=["sel", "a", "b", "c", "d"],
+                    output_width=4)],
+        top="t",
+    )
+    text = emit_module(g)
+    # 4-way mux: chained ternary referencing sel == 0/1/2 plus default
+    assert "(sel == 0)" in text
+    assert "(sel == 1)" in text
+    assert "(sel == 2)" in text
+
+
+def test_mux_rejects_data_width_mismatch():
+    g = GateGraph(
+        inputs=[Signal("sel", width=1),
+                Signal("a", width=8), Signal("b", width=4)],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="mux", inputs=["sel", "a", "b"],
+                    output_width=8)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="mux"):
+        emit_module(g)
+
+
+# ---- Slice / concat width validation ---------------------------------------
+
+
+def test_slice_single_bit():
+    g = GateGraph(
+        inputs=[Signal("x", width=8)],
+        outputs=[Signal("y", width=1)],
+        gates=[Gate(name="y", kind="slice", inputs=["x"],
+                    attrs={"hi": 3, "lo": 3}, output_width=1)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "x[3]" in text
+
+
+def test_slice_rejects_width_mismatch():
+    g = GateGraph(
+        inputs=[Signal("x", width=8)],
+        outputs=[Signal("y", width=4)],
+        gates=[Gate(name="y", kind="slice", inputs=["x"],
+                    attrs={"hi": 7, "lo": 0},   # would need width 8
+                    output_width=4)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="slice"):
+        emit_module(g)
+
+
+def test_slice_rejects_out_of_range():
+    g = GateGraph(
+        inputs=[Signal("x", width=4)],
+        outputs=[Signal("y", width=2)],
+        gates=[Gate(name="y", kind="slice", inputs=["x"],
+                    attrs={"hi": 5, "lo": 4}, output_width=2)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="only 4 bits"):
+        emit_module(g)
+
+
+def test_slice_rejects_hi_lt_lo():
+    g = GateGraph(
+        inputs=[Signal("x", width=8)],
+        outputs=[Signal("y", width=1)],
+        gates=[Gate(name="y", kind="slice", inputs=["x"],
+                    attrs={"hi": 2, "lo": 5}, output_width=1)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="hi=2 < lo=5"):
+        emit_module(g)
+
+
+def test_concat_rejects_width_mismatch():
+    g = GateGraph(
+        inputs=[Signal("a", width=4), Signal("b", width=4)],
+        outputs=[Signal("y", width=10)],   # 4+4 != 10
+        gates=[Gate(name="y", kind="concat", inputs=["a", "b"],
+                    output_width=10)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="concat"):
+        emit_module(g)
+
+
+# ---- ROM extras -------------------------------------------------------------
+
+
+def test_rom_zero_pads_when_depth_exceeds_init():
+    g = GateGraph(
+        inputs=[Signal("addr", width=2)],
+        outputs=[Signal("d", width=8)],
+        gates=[Gate(name="d", kind="rom", inputs=["addr"],
+                    attrs={"init": [10, 20], "width": 8, "depth": 4},
+                    output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "d_mem[0] = 8'd10;" in text
+    assert "d_mem[1] = 8'd20;" in text
+    assert "d_mem[2] = 8'd0;" in text
+    assert "d_mem[3] = 8'd0;" in text
+
+
+def test_rom_emits_ram_style_pragma():
+    g = GateGraph(
+        inputs=[Signal("addr", width=1)],
+        outputs=[Signal("d", width=8)],
+        gates=[Gate(name="d", kind="rom", inputs=["addr"],
+                    attrs={"init": [0, 1], "width": 8, "depth": 2,
+                           "ram_style": "block"},
+                    output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert '(* ram_style = "block" *)' in text
+
+
+def test_rom_rejects_init_larger_than_depth():
+    g = GateGraph(
+        inputs=[Signal("addr", width=1)],
+        outputs=[Signal("d", width=8)],
+        gates=[Gate(name="d", kind="rom", inputs=["addr"],
+                    attrs={"init": [0, 1, 2, 3], "width": 8, "depth": 2},
+                    output_width=8)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="smaller than init"):
+        emit_module(g)
+
+
+def test_rom_rejects_width_mismatch():
+    g = GateGraph(
+        inputs=[Signal("addr", width=1)],
+        outputs=[Signal("d", width=4)],
+        gates=[Gate(name="d", kind="rom", inputs=["addr"],
+                    attrs={"init": [0, 1], "width": 8, "depth": 2},
+                    output_width=4)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="output_width"):
+        emit_module(g)
+
+
+# ---- Register edge cases ----------------------------------------------------
+
+
+def test_register_without_rst():
+    g = GateGraph(
+        inputs=[Signal("d", width=4)],
+        outputs=[Signal("q", width=4)],
+        gates=[Gate(name="q", kind="register", inputs=["d"],
+                    attrs={"clk": "clk"}, output_width=4)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "always @(posedge clk) q <= d;" in text
+    assert "always @(posedge clk or" not in text
+
+
+# ---- Constant edge cases ----------------------------------------------------
+
+
+def test_negative_signed_constant_emits_twos_complement():
+    g = GateGraph(
+        inputs=[],
+        outputs=[Signal("c", width=4, signed=True)],
+        gates=[Gate(name="c", kind="constant",
+                    attrs={"value": -3},
+                    output_width=4, output_signed=True)],
+        top="t",
+    )
+    text = emit_module(g)
+    # -3 in 4-bit two's complement = 13 (0b1101)
+    assert "4'sd13" in text
+
+
+def test_unsigned_constant_emits_unsigned_literal():
+    g = GateGraph(
+        inputs=[],
+        outputs=[Signal("c", width=8)],
+        gates=[Gate(name="c", kind="constant",
+                    attrs={"value": 200}, output_width=8)],
+        top="t",
+    )
+    text = emit_module(g)
+    assert "8'd200" in text
+    assert "8'sd" not in text
+
+
+# ---- Arity checks for previously-unchecked kinds ---------------------------
+
+
+def test_shift_left_rejects_zero_inputs():
+    g = GateGraph(
+        inputs=[],
+        outputs=[Signal("y", width=8)],
+        gates=[Gate(name="y", kind="shift_left", inputs=[],
+                    attrs={"amount": 1}, output_width=8)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="shift_left"):
+        emit_module(g)
+
+
+def test_slice_rejects_zero_inputs():
+    g = GateGraph(
+        inputs=[],
+        outputs=[Signal("y", width=1)],
+        gates=[Gate(name="y", kind="slice", inputs=[],
+                    attrs={"hi": 0, "lo": 0}, output_width=1)],
+        top="t",
+    )
+    with pytest.raises(ValueError, match="slice"):
+        emit_module(g)

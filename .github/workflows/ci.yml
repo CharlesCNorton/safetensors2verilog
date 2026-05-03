@@ -20,18 +20,57 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Install Icarus Verilog
+      - name: Install Icarus Verilog and Yosys
         run: |
           sudo apt-get update
-          sudo apt-get install -y iverilog
+          sudo apt-get install -y iverilog yosys
 
       - name: Install package
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[test]
+          pip install -e .[test,onnx]
 
-      - name: Run pytest
-        run: pytest -v
+      - name: Run pytest with coverage
+        run: pytest -v --cov=safetensors2verilog --cov-report=term-missing
 
       - name: Run half-adder example end-to-end
         run: python examples/threshold_alu/run.py
+
+      - name: Run bitnet_linear example end-to-end
+        run: python examples/bitnet_linear/run.py
+
+      - name: Synthesize half-adder with Yosys
+        run: |
+          yosys -p "
+            read_verilog examples/threshold_alu/output/half_adder.v;
+            synth -top half_adder;
+            abc -lut 6;
+            stat;
+          "
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff
+        run: ruff check safetensors2verilog tests
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package and mypy
+        run: |
+          pip install --upgrade pip
+          pip install -e .[dev]
+          pip install mypy
+      - name: Run mypy
+        run: mypy safetensors2verilog

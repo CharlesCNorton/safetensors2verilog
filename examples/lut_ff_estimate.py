@@ -37,7 +37,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-VARIANTS_DIR = Path("D:/8bit-threshold-computer/variants")
+DEFAULT_VARIANTS_DIR = Path("D:/8bit-threshold-computer/variants")
 
 
 def luts_for_fanin(f: int) -> int:
@@ -114,11 +114,21 @@ def state_bits(m: dict) -> int:
 
 
 def main() -> int:
-    if not VARIANTS_DIR.exists():
-        print(f"variants dir not found: {VARIANTS_DIR}", file=sys.stderr)
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "variants_dir", nargs="?", type=Path, default=DEFAULT_VARIANTS_DIR,
+        help=f"directory containing .safetensors variants "
+             f"(default: {DEFAULT_VARIANTS_DIR})",
+    )
+    args = parser.parse_args()
+    variants_dir = args.variants_dir
+
+    if not variants_dir.exists():
+        print(f"variants dir not found: {variants_dir}", file=sys.stderr)
         return 2
 
-    files = sorted(VARIANTS_DIR.glob("*.safetensors"))
+    files = sorted(variants_dir.glob("*.safetensors"))
     print(f"{'variant':<42} {'gates':>10} {'avg_fan':>8} {'LUTs (logic)':>14} {'FFs (state)':>12}  {'fan-in dist <=6/7-12/13-24/25-64/>64':>40}")
     print("-" * 140)
     for f in files:

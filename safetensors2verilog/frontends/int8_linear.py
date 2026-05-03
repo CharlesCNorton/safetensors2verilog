@@ -1,35 +1,31 @@
-"""BitNet b1.58 ternary linear frontend.
+"""Int8 linear-layer frontend.
 
-BitNet b1.58 represents `nn.Linear` weights as ternary {-1, 0, 1};
-activations are multi-bit (typically int8). This frontend reads a
-safetensors file describing one or more chained ternary linear
-layers and emits a dataflow network that computes
-``y = (W_n · ... · W_1 · x) + biases``.
+Reads a safetensors file describing one or more chained quantized
+linear layers with arbitrary signed integer weights. Each layer
+becomes one ``linear`` gate per output neuron, with an optional
+saturating clamp and optional pipeline register.
 
 Tensor naming convention (matches PyTorch's ``state_dict`` for a
 ``nn.Sequential([nn.Linear, ...])``):
 
-  <prefix>.<n>.weight    int / float tensor with shape [out, in], values in {-1, 0, 1}
-  <prefix>.<n>.bias      int / float tensor with shape [out] (optional)
+  <prefix>.<n>.weight   integer / float tensor with shape [out, in]
+  <prefix>.<n>.bias     integer / float tensor with shape [out] (optional)
 
 Default ``prefix`` is ``layers``. Override with ``--layer-prefix``.
 
-The emitted module has one signed input port per element of the first
-layer's input vector and one signed output port per element of the
-last layer's output vector. Activation width is set by
-``--activation-bits``. Per-layer accumulator widths grow to keep the
-worst-case MAC sum lossless.
+Weights may be any integers (within ``--weight-bits``); ternary models
+will work, but if all your weights are in {-1, 0, 1}, the more
+constrained ``bitnet_linear`` frontend will reject non-ternary inputs
+explicitly.
+
+Activation width is set by ``--activation-bits`` (default 8). The
+per-layer accumulator widens by ``weight-bits + ceil(log2(in_features))``
+to keep the worst-case sum lossless.
 
 Optional features:
-  --output-clamp LO,HI  Wrap each layer's output in a clamp gate
-                        (truncates the accumulator to LO..HI). When
-                        combined with --activation-bits N, a typical
-                        choice is LO=-(2^(N-1)) HI=2^(N-1)-1, which
-                        keeps each layer's output back in N bits.
-  --pipeline            Register each layer's output; the resulting
-                        Verilog has a clk port and one cycle of
-                        latency per layer. Combine with --output-clamp
-                        for a saturating, pipelined inference core.
+  --output-clamp LO,HI   Wrap each output in a clamp gate.
+  --pipeline             Register each layer's output (one cycle of
+                         latency per layer).
 """
 
 from __future__ import annotations
@@ -42,15 +38,11 @@ from safetensors import safe_open
 from ..core import Frontend, FrontendOption, Gate, GateGraph, Signal, registry
 
 
-def _is_ternary(t: torch.Tensor, atol: float = 1e-6) -> bool:
-    if t.dtype.is_floating_point:
-        tf = t.to(torch.float64)
-        if not bool(torch.isclose(tf, tf.round(), atol=atol).all().item()):
-            return False
-        rounded = tf.round()
-    else:
-        rounded = t.to(torch.float64)
-    return bool((rounded.abs() <= 1.0).all().item())
+def _is_integer_tensor(t: torch.Tensor, atol: float = 1e-6) -> bool:
+    if not t.dtype.is_floating_point:
+        return True
+    tf = t.to(torch.float64)
+    return bool(torch.isclose(tf, tf.round(), atol=atol).all().item())
 
 
 def _to_int_list_2d(t: torch.Tensor) -> list[list[int]]:
@@ -69,9 +61,7 @@ def _parse_clamp_arg(arg: str | None) -> tuple[int, int] | None:
         return None
     parts = arg.split(",")
     if len(parts) != 2:
-        raise ValueError(
-            f"--output-clamp expects 'LO,HI'; got {arg!r}"
-        )
+        raise ValueError(f"--output-clamp expects 'LO,HI'; got {arg!r}")
     try:
         lo = int(parts[0])
         hi = int(parts[1])
@@ -83,11 +73,11 @@ def _parse_clamp_arg(arg: str | None) -> tuple[int, int] | None:
 
 
 @registry.register(
-    "bitnet_linear",
-    description="BitNet b1.58-style ternary linear layers with multibit activations.",
-    metadata_namespace="bitnet_linear",
+    "int8_linear",
+    description="Quantized linear layers with signed integer weights and multibit activations.",
+    metadata_namespace="int8_linear",
 )
-class BitNetLinearFrontend(Frontend):
+class Int8LinearFrontend(Frontend):
 
     @classmethod
     def options(cls) -> list[FrontendOption]:
@@ -97,6 +87,16 @@ class BitNetLinearFrontend(Frontend):
                 type=int,
                 default=8,
                 help="bit width of input activations (signed two's complement).",
+            ),
+            FrontendOption(
+                name="weight-bits",
+                type=int,
+                default=8,
+                help=(
+                    "expected bit width of weights (signed). Used to size each "
+                    "layer's accumulator; weights outside [-2^(N-1), 2^(N-1)-1] "
+                    "are rejected."
+                ),
             ),
             FrontendOption(
                 name="layer-prefix",
@@ -114,7 +114,7 @@ class BitNetLinearFrontend(Frontend):
                 help=(
                     "clamp each layer output to LO,HI integers (e.g. -128,127 "
                     "for int8 saturation). Wraps each layer's MAC in a 'clamp' "
-                    "gate. Width is inherited from the activation-bits choice."
+                    "gate."
                 ),
             ),
             FrontendOption(
@@ -133,11 +133,16 @@ class BitNetLinearFrontend(Frontend):
         path: Path,
         top: str = "top",
         activation_bits: int = 8,
+        weight_bits: int = 8,
         layer_prefix: str = "layers",
         output_clamp: str | None = None,
         pipeline: bool = False,
         **options,
     ) -> GateGraph:
+        if weight_bits < 2:
+            raise ValueError(f"weight-bits must be >= 2, got {weight_bits}")
+        weight_lo = -(1 << (weight_bits - 1))
+        weight_hi = (1 << (weight_bits - 1)) - 1
         clamp_range = _parse_clamp_arg(output_clamp)
 
         tensors: dict[str, torch.Tensor] = {}
@@ -174,7 +179,6 @@ class BitNetLinearFrontend(Frontend):
             for i in range(in_size)
         ]
         prev_outputs: list[str] = [s.name for s in input_signals]
-
         accumulator_width = activation_bits
 
         for layer_idx in layer_indices:
@@ -190,19 +194,31 @@ class BitNetLinearFrontend(Frontend):
                     f"layer {layer_idx}: in_features={w.shape[1]} but "
                     f"previous stage produced {len(prev_outputs)} signals"
                 )
-            if not _is_ternary(w):
+            if not _is_integer_tensor(w):
                 raise ValueError(
-                    f"layer {layer_idx} weights are not ternary {{-1, 0, 1}}"
+                    f"layer {layer_idx} weights are not integer-valued"
                 )
+
+            wrows = _to_int_list_2d(w)
+            for j, row in enumerate(wrows):
+                for i, wij in enumerate(row):
+                    if wij < weight_lo or wij > weight_hi:
+                        raise ValueError(
+                            f"layer {layer_idx} weight[{j}][{i}]={wij} is "
+                            f"outside [{weight_lo}, {weight_hi}] for "
+                            f"--weight-bits={weight_bits}"
+                        )
 
             out_size, layer_in = w.shape
             biases: list[int] | None = None
             if bkey in tensors:
+                if not _is_integer_tensor(tensors[bkey]):
+                    raise ValueError(
+                        f"layer {layer_idx} bias is not integer-valued"
+                    )
                 biases = _to_int_list_1d(tensors[bkey])
 
-            wrows = _to_int_list_2d(w)
-
-            grow = max(1, layer_in.bit_length()) + 1
+            grow = weight_bits + max(1, layer_in.bit_length())
             mac_width = accumulator_width + grow
 
             this_outputs: list[str] = []
@@ -211,20 +227,13 @@ class BitNetLinearFrontend(Frontend):
                 bias_val = biases[j] if biases else 0
                 final = f"L{layer_idx}.y{j}"
 
-                # Optional post-MAC stages: clamp and/or pipeline register.
-                # The 'linear' gate emits the raw Σ w*x + b. If we need a
-                # clamp or register after it, we emit it under a private
-                # name and have the post-stage carry the public layer-output
-                # name. If there are no post-stages, the linear gate IS
-                # the public output.
                 need_clamp = clamp_range is not None
                 need_register = pipeline
                 if need_register:
                     mac_name = f"L{layer_idx}.y{j}.mac"
-                    if need_clamp:
-                        clamped_name = f"L{layer_idx}.y{j}.clamped"
-                    else:
-                        clamped_name = mac_name
+                    clamped_name = (
+                        f"L{layer_idx}.y{j}.clamped" if need_clamp else mac_name
+                    )
                 elif need_clamp:
                     mac_name = f"L{layer_idx}.y{j}.mac"
                     clamped_name = final

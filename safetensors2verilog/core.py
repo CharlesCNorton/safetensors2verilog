@@ -25,9 +25,10 @@ on each Gate.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 
 @dataclass
@@ -64,8 +65,8 @@ class Gate:
     """
     name: str
     kind: str = "threshold"
-    inputs: List[str] = field(default_factory=list)
-    attrs: Dict[str, Any] = field(default_factory=dict)
+    inputs: list[str] = field(default_factory=list)
+    attrs: dict[str, Any] = field(default_factory=dict)
     output_width: int = 1
     output_signed: bool = False
 
@@ -79,9 +80,9 @@ class GateGraph:
     gates:   dataflow nodes, must be topologically sorted
     top:     module name in the generated Verilog
     """
-    inputs: List[Signal]
-    outputs: List[Signal]
-    gates: List[Gate]
+    inputs: list[Signal]
+    outputs: list[Signal]
+    gates: list[Gate]
     top: str = "top"
 
 
@@ -102,7 +103,7 @@ class FrontendOption:
     type: type = str
     default: Any = None
     help: str = ""
-    metavar: Optional[str] = None
+    metavar: str | None = None
 
 
 class Frontend:
@@ -120,7 +121,7 @@ class Frontend:
     metadata_namespace: str = ""
 
     @classmethod
-    def options(cls) -> List[FrontendOption]:
+    def options(cls) -> list[FrontendOption]:
         """Per-frontend CLI options. Override to expose flags."""
         return []
 
@@ -133,7 +134,7 @@ class Frontend:
 
 class _Registry:
     def __init__(self) -> None:
-        self._frontends: Dict[str, type[Frontend]] = {}
+        self._frontends: dict[str, type[Frontend]] = {}
 
     def register(
         self,
@@ -157,7 +158,7 @@ class _Registry:
             )
         return self._frontends[name]
 
-    def names(self) -> List[Tuple[str, str]]:
+    def names(self) -> list[tuple[str, str]]:
         return [
             (name, cls.description)
             for name, cls in sorted(self._frontends.items())

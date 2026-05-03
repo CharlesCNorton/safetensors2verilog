@@ -1,5 +1,7 @@
 """safetensors2verilog: compile safetensors networks to synthesis-ready Verilog."""
 
+# Importing each frontend module registers it via the registry decorator.
+from . import frontends  # noqa: F401
 from .core import (
     Frontend,
     FrontendOption,
@@ -14,9 +16,6 @@ from .verilog import (
     lowering,
     registered_kinds,
 )
-
-# Importing each frontend module registers it via the registry decorator.
-from . import frontends  # noqa: F401
 
 __all__ = [
     "Frontend",
