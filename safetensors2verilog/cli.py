@@ -36,6 +36,19 @@ def main(argv=None) -> int:
         "--list-frontends", action="store_true",
         help="print registered frontends and exit",
     )
+    parser.add_argument(
+        "--skip-memory", "--bram", dest="skip_memory", action="store_true",
+        help="drop memory.* gates from the network so they can be served by "
+             "a vendor BRAM block. Read-side signals are promoted to external "
+             "inputs; address/data/write-enable signals appear as external "
+             "outputs on the resulting CPU core.",
+    )
+    parser.add_argument(
+        "--emit-bram-template", type=Path, default=None, metavar="PATH",
+        help="alongside the main Verilog output, write a synchronous BRAM "
+             "template module (single-port read/write, 8-bit data, "
+             "configurable address width). Implies --skip-memory.",
+    )
     args = parser.parse_args(argv)
 
     if args.list_frontends:
@@ -48,9 +61,10 @@ def main(argv=None) -> int:
     if not args.input.exists():
         parser.error(f"file not found: {args.input}")
 
+    skip_memory = args.skip_memory or args.emit_bram_template is not None
     frontend_cls = registry.get(args.frontend)
     frontend = frontend_cls()
-    graph = frontend.parse(args.input, top=args.top)
+    graph = frontend.parse(args.input, top=args.top, skip_memory=skip_memory)
     text = emit_module(graph)
 
     if args.output is None:
@@ -63,6 +77,28 @@ def main(argv=None) -> int:
             f"{len(graph.inputs)} inputs, {len(graph.outputs)} outputs)",
             file=sys.stderr,
         )
+
+    if args.emit_bram_template is not None:
+        from .verilog import emit_bram_template
+        # Derive address width from the variant's manifest (memory_bytes)
+        # if available; fall back to 16 (64 KB) when missing.
+        addr_bits = 16
+        try:
+            from safetensors import safe_open
+            with safe_open(str(args.input), framework="pt") as f:
+                if "manifest.addr_bits" in f.keys():
+                    addr_bits = int(f.get_tensor("manifest.addr_bits").item())
+        except Exception:
+            pass
+        bram_text = emit_bram_template(addr_bits=addr_bits)
+        args.emit_bram_template.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_bram_template.write_text(bram_text, encoding="utf-8")
+        print(
+            f"wrote {args.emit_bram_template} (BRAM template, "
+            f"{addr_bits}-bit addr, 8-bit data)",
+            file=sys.stderr,
+        )
+
     return 0
 
 

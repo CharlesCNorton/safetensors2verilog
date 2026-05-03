@@ -50,7 +50,7 @@ def _as_int_list(t: torch.Tensor) -> List[int]:
 )
 class ThresholdLogicFrontend(Frontend):
 
-    def parse(self, path: Path, top: str = "top", **options) -> GateGraph:
+    def parse(self, path: Path, top: str = "top", skip_memory: bool = False, **options) -> GateGraph:
         tensors: Dict[str, torch.Tensor] = {}
         signal_registry: Dict[int, str] = {}
         with safe_open(str(path), framework="pt") as f:
@@ -185,12 +185,45 @@ class ThresholdLogicFrontend(Frontend):
 
             gates_raw.append((gname, weights, input_names, bias))
 
+        # ----- BRAM carve-out: drop the memory.* gates and let a real
+        # vendor block-RAM serve those reads/writes. The signals that
+        # non-memory gates were consuming from memory.* (read data bits)
+        # become external module inputs, ready to be wired to BRAM
+        # data_out. The signals that memory.* gates consume ($addr,
+        # $data, $we, etc.) are already external and become natural
+        # outputs of the resulting CPU core.
+        if skip_memory:
+            mem_prefix = "memory."
+            mem_gate_set = {n for n, *_ in gates_raw if n.startswith(mem_prefix)}
+            promoted: Set[str] = set()
+            for name, _w, inputs, _b in gates_raw:
+                if name.startswith(mem_prefix):
+                    continue
+                for inp in inputs:
+                    if inp in mem_gate_set:
+                        promoted.add(inp)
+                        external_inputs.add(inp)
+            gates_raw = [g for g in gates_raw if not g[0].startswith(mem_prefix)]
+            self._memory_skipped = len(mem_gate_set)
+            self._memory_promoted = len(promoted)
+
+            referenced: Set[str] = set()
+            for _n, _w, inputs, _b in gates_raw:
+                referenced.update(inputs)
+            external_inputs = {x for x in external_inputs if x in referenced}
+
         if non_ternary_warnings:
             print(
                 f"warning: {len(non_ternary_warnings)} gate(s) have weights "
                 f"outside {{-1, 0, 1}}; the backend handles them but the "
                 f"generated RTL will use larger adder trees for those gates. "
                 f"First few: {non_ternary_warnings[:5]}"
+            )
+        if getattr(self, "_memory_skipped", 0):
+            print(
+                f"info: skipped {self._memory_skipped} memory.* gate(s); "
+                f"{self._memory_promoted} read-side signal(s) promoted to "
+                f"external inputs. Wire them to a vendor BRAM block."
             )
         if getattr(self, "_stale_count", 0):
             print(
