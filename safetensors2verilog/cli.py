@@ -258,6 +258,22 @@ def main(argv: list[str] | None = None) -> int:
         attr = opt.name.replace("-", "_")
         fe_kwargs[attr] = getattr(args, attr)
 
+    if args.diag_format == "json":
+        import warnings as _warnings
+
+        def _showwarning_json(message, category, filename, lineno,
+                              file=None, line=None):
+            payload = json.dumps({
+                "level": "warning",
+                "category": getattr(category, "__name__", str(category)),
+                "message": str(message),
+                "file": str(filename),
+                "line": lineno,
+            })
+            print(payload, file=file or sys.stderr)
+
+        _warnings.showwarning = _showwarning_json
+
     frontend = frontend_cls()
     graph = frontend.parse(args.input, top=args.top, **fe_kwargs)
 

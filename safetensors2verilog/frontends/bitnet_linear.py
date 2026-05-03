@@ -103,12 +103,19 @@ def _build_sequential(
     Architecture: a 3-state FSM (IDLE / COMPUTE / DONE), a per-layer
     counter that walks 0..in_size[L]-1, an out_size[L]-wide bank of
     ternary-weight ROMs and accumulators per layer. On `start`, all
-    accumulators reset to 0; the FSM enters COMPUTE for layer 0; each
-    cycle reads one weight per output neuron and adds (or subtracts) the
-    selected input. When the last input of a layer completes, the FSM
-    advances to the next layer; layer L's accumulators feed layer L+1's
-    input mux. After the final layer's last MAC, the FSM enters DONE
-    for one cycle, then returns to IDLE.
+    accumulators preload to their layer's bias value; the FSM enters
+    COMPUTE for layer 0; each cycle reads one weight per output neuron
+    and adds (or subtracts) the selected input. When the last input of
+    a layer completes, the FSM advances to the next layer; layer L's
+    accumulators feed layer L+1's input mux. After the final layer's
+    last MAC, the FSM enters DONE for one cycle, then returns to IDLE.
+
+    Reset semantics: an asynchronous `rst` clears all accumulators to 0
+    (the register kind's default init). This is distinct from the
+    `start` pulse, which preloads each accumulator to its bias before
+    the first MAC of a new inference. Reading outputs while in IDLE
+    (without ever asserting `start`) yields 0; outputs are only valid
+    when `done` is asserted.
 
     Notes on the IR shape:
       - Ternary weights are stored as 2-bit signed values (-1, 0, +1).

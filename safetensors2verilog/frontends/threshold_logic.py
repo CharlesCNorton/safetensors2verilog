@@ -87,11 +87,14 @@ class ThresholdLogicFrontend(Frontend):
         strict: bool = False,
         **options,
     ) -> GateGraph:
+        from ..core import validate_metadata_namespace
+
         # ---- Load tensors and signal registry ----
         tensors: dict[str, torch.Tensor] = {}
         signal_registry: dict[int, str] = {}
         with safe_open(str(path), framework="pt") as f:
             meta = f.metadata() or {}
+            validate_metadata_namespace(type(self), meta)
             if "signal_registry" in meta:
                 raw = json.loads(meta["signal_registry"])
                 signal_registry = {int(k): v for k, v in raw.items()}
@@ -309,39 +312,47 @@ class ThresholdLogicFrontend(Frontend):
 
     @staticmethod
     def _print_warnings(non_ternary: list[str], stats: dict[str, int]) -> None:
+        import warnings
+
         if non_ternary:
-            print(
-                f"warning: {len(non_ternary)} gate(s) have non-ternary weights; "
+            warnings.warn(
+                f"{len(non_ternary)} gate(s) have non-ternary weights; "
                 f"the IR carries them as integer weights (kind='threshold' with "
                 f"weights:list[int]). Synthesis lowers k*x as a constant-coefficient "
-                f"multiplier. First few: {non_ternary[:5]}"
+                f"multiplier. First few: {non_ternary[:5]}",
+                UserWarning, stacklevel=2,
             )
         if stats.get("unpacked"):
-            print(
-                f"info: unpacked {stats['unpacked']} sub-gate(s) from packed tensors."
+            warnings.warn(
+                f"unpacked {stats['unpacked']} sub-gate(s) from packed tensors.",
+                UserWarning, stacklevel=2,
             )
         if stats.get("skipped_packed"):
-            print(
-                f"warning: skipped {stats['skipped_packed']} packed tensor(s) "
-                f"with non-rectangular layout."
+            warnings.warn(
+                f"skipped {stats['skipped_packed']} packed tensor(s) "
+                f"with non-rectangular layout.",
+                UserWarning, stacklevel=2,
             )
         if stats.get("stale_routing"):
-            print(
-                f"warning: {stats['stale_routing']} gate(s) had .inputs metadata "
+            warnings.warn(
+                f"{stats['stale_routing']} gate(s) had .inputs metadata "
                 f"out of sync with .weight; their inputs were promoted to anonymous "
-                f"external ports. Regenerate the safetensors' routing metadata."
+                f"external ports. Regenerate the safetensors' routing metadata.",
+                UserWarning, stacklevel=2,
             )
         if stats.get("missing_routing"):
-            print(
-                f"warning: {stats['missing_routing']} gate(s) had no .inputs "
-                f"metadata; their inputs were promoted to anonymous external ports."
+            warnings.warn(
+                f"{stats['missing_routing']} gate(s) had no .inputs "
+                f"metadata; their inputs were promoted to anonymous external ports.",
+                UserWarning, stacklevel=2,
             )
         if stats.get("mem_skipped"):
-            print(
-                f"info: skipped {stats['mem_skipped']} memory.* gate(s); "
+            warnings.warn(
+                f"skipped {stats['mem_skipped']} memory.* gate(s); "
                 f"{stats.get('mem_promoted', 0)} read-side reference(s) were "
                 f"promoted to external inputs. Wire them to a vendor BRAM block "
-                f"(use --emit-bram-template to get a starter module)."
+                f"(use --emit-bram-template to get a starter module).",
+                UserWarning, stacklevel=2,
             )
 
     @staticmethod

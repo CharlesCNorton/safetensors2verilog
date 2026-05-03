@@ -90,3 +90,40 @@ def test_per_frontend_flag_is_accepted():
         r = _run_cli(str(ip), "-o", str(op), "--frontend", "threshold_logic",
                      "--skip-memory")
         assert r.returncode == 0, r.stderr
+
+
+def test_emit_sdc_writes_starter_constraints():
+    with tempfile.TemporaryDirectory() as td:
+        ip = Path(td) / "in.safetensors"
+        op = Path(td) / "out.v"
+        sdc = Path(td) / "out.sdc"
+        _make_simple_safetensors(ip)
+        r = _run_cli(str(ip), "-o", str(op),
+                     "--emit-sdc", str(sdc),
+                     "--sdc-period-ns", "8.0")
+        assert r.returncode == 0, r.stderr
+        assert sdc.exists()
+        text = sdc.read_text()
+        # No clk in this trivial graph (combinational), so SDC notes that
+        assert "no clk port detected" in text or "create_clock" in text
+
+
+def test_target_sv_emits_systemverilog():
+    with tempfile.TemporaryDirectory() as td:
+        ip = Path(td) / "in.safetensors"
+        op = Path(td) / "out.sv"
+        _make_simple_safetensors(ip)
+        r = _run_cli(str(ip), "-o", str(op), "--target", "sv")
+        assert r.returncode == 0, r.stderr
+        text = op.read_text()
+        assert "logic" in text
+
+
+def test_dry_run_emits_no_output_file():
+    with tempfile.TemporaryDirectory() as td:
+        ip = Path(td) / "in.safetensors"
+        op = Path(td) / "out.v"
+        _make_simple_safetensors(ip)
+        r = _run_cli(str(ip), "-o", str(op), "--dry-run")
+        assert r.returncode == 0, r.stderr
+        assert not op.exists()
