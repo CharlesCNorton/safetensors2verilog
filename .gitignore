@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# generated artifacts during examples / tests
+*.vvp
+*.vcd
+examples/**/output/
