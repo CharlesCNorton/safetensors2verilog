@@ -90,6 +90,10 @@ class ThresholdLogicFrontend(Frontend):
                 raise ValueError(f"gate '{gname}': weights are not integer-valued")
             if not _is_integer_tensor(b):
                 raise ValueError(f"gate '{gname}': bias is not integer-valued")
+            # Skip packed multi-gate tensors: weight shape != [N] or bias != [1]/scalar
+            if w.dim() != 1 or b.numel() != 1:
+                self._packed_count = getattr(self, "_packed_count", 0) + 1
+                continue
             if not _is_ternary(w):
                 non_ternary_warnings.append(gname)
 
@@ -98,27 +102,40 @@ class ThresholdLogicFrontend(Frontend):
 
             # Resolve input names
             input_names: List[str]
+            stale_inputs = False
             if i_key in tensors:
                 ids = _as_int_list(tensors[i_key])
                 if len(ids) != len(weights):
-                    raise ValueError(
-                        f"gate '{gname}': .inputs has {len(ids)} entries but "
-                        f".weight has {len(weights)}"
-                    )
-                input_names = []
-                for sid in ids:
-                    if sid in signal_registry:
-                        input_names.append(signal_registry[sid])
-                    else:
-                        input_names.append(f"_unresolved_id_{sid}")
+                    # Stale routing: tensor was rebuilt (different fan-in) but
+                    # .inputs wasn't regenerated. Treat as if no routing info.
+                    stale_inputs = True
+                    input_names = [f"{gname}.in{i}" for i in range(len(weights))]
+                else:
+                    input_names = []
+                    for sid in ids:
+                        if sid in signal_registry:
+                            input_names.append(signal_registry[sid])
+                        else:
+                            # Unresolved IDs (e.g. -1 placeholders) become
+                            # synthetic external inputs.
+                            placeholder = f"_unresolved_{gname}_id{sid}"
+                            input_names.append(placeholder)
+                            external_inputs.add(placeholder)
             else:
                 # No routing info; the gate's logical inputs are unknown.
-                # Fall back to anonymous-input names (so we can still emit
-                # a pure module that takes them as ports).
                 input_names = [f"{gname}.in{i}" for i in range(len(weights))]
+                self._missing_routing_count = getattr(self, "_missing_routing_count", 0) + 1
+
+            if stale_inputs:
+                self._stale_count = getattr(self, "_stale_count", 0) + 1
 
             for inp in input_names:
                 if inp.startswith("$"):
+                    external_inputs.add(inp)
+                elif inp.startswith(f"{gname}.in"):
+                    # Anonymous placeholder for a gate without proper routing
+                    # metadata: promote to external so the file is at least
+                    # synthesizable. Caller should regenerate .inputs.
                     external_inputs.add(inp)
 
             gates_raw.append((gname, weights, input_names, bias))
@@ -129,6 +146,19 @@ class ThresholdLogicFrontend(Frontend):
                 f"outside {{-1, 0, 1}}; the backend handles them but the "
                 f"generated RTL will use larger adder trees for those gates. "
                 f"First few: {non_ternary_warnings[:5]}"
+            )
+        if getattr(self, "_stale_count", 0):
+            print(
+                f"warning: {self._stale_count} gate(s) have stale .inputs "
+                f"metadata (length mismatch with .weight); their inputs "
+                f"have been promoted to external module ports. Regenerate "
+                f"the file's .inputs metadata for accurate routing."
+            )
+        if getattr(self, "_packed_count", 0):
+            print(
+                f"warning: skipped {self._packed_count} packed gate(s) "
+                f"(multi-dimensional weight or non-scalar bias); the "
+                f"v0.1 frontend handles only one gate per tensor pair."
             )
 
         # Topological sort
