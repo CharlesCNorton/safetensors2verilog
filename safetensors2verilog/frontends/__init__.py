@@ -8,6 +8,7 @@ To add a new frontend:
 
 from . import (
     bitnet_linear,  # noqa: F401
+    hf_llama,  # noqa: F401
     int8_linear,  # noqa: F401
     onnx_topology,  # noqa: F401
     threshold_logic,  # noqa: F401
