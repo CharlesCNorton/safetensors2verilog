@@ -56,4 +56,42 @@ Open:
 36. The bitnet_linear ROM stores 2-bit signed weights; no ECC, no parity, no integrity checks if the BRAM bit-flips.
 37. Documentation for the `evaluate_graph` register-state contract is informal; a helper that walks N cycles of a sequential graph and returns a trace would make sequential testing cleaner.
 
-Categories (rough): items 1–11 are scoped-out features needing IR or frontend extensions; 12–17 are followups on existing surface area; 18–22 are docs/release polish; 23–26 are external validation; 27–37 are smaller architectural gaps.
+### Language model support
+
+Concrete target: faithful Verilog translation of LLaMA-style transformers (SmolLM2-135M-Instruct, Qwen3-0.6B). Verified empirically by inspecting `HuggingFaceTB/SmolLM2-135M-Instruct` (134.5M bf16 params, 30 decoder layers, hidden=576, GQA 9/3, intermediate=1536, vocab=49152, RoPE θ=1e5, tied lm_head): all four existing frontends reject the file up front (weights are bf16, not integer / ternary; no `signal_registry`; no ONNX). The IR has no representation for RMSNorm, RoPE, Softmax, embedding lookup, or KV cache. Items below are the gap. The bar is *faithful translation* — synthesizability and area are secondary, but the backend's flat-text matmul lowering also has to change for any layer wider than a few thousand inputs (see item 51).
+
+#### Numeric format
+
+38. Fixed-point format primitive on `Signal`: a `(q_int_bits, q_frac_bits, signed)` triple, surfaced through every arithmetic kind. Prerequisite for every transcendental below. Generalises and unblocks items 2 and 3.
+39. Quantization frontend (e.g. `quant_linear`): takes a fp16/bf16 safetensors plus a quant spec (per-tensor or per-channel int8/int4, GPTQ/AWQ layout) and emits an IR with explicit weight ROMs + scale tensors + multibit dequant gates. Required because nothing today accepts non-integer weights, and the only realistic LM compile path is post-training quantization.
+
+#### Activation primitives (build on item 38)
+
+40. `rms_norm` IR kind: `gamma * x / sqrt(mean(x*x) + eps)`. Decomposes into square / sum / mean / `fp_rsqrt` / mul over the last axis. LayerNorm (item 2) reduces to `rms_norm` plus a centering subtract.
+41. `silu` and `gelu` IR kinds. SiLU = `x * sigmoid(x)`; sigmoid via either an 8K-entry x 8-bit ROM or piecewise-linear approximation. GELU via tanh approximation.
+42. `softmax` IR kind with the running-max stability trick: subtract max, `fp_exp`, sum, `fp_div`. A separate `mask_then_softmax` kind keeps the causal mask out of `exp`.
+43. `fp_rsqrt`, `fp_exp`, `fp_div`, `fp_recip` primitives: Newton-Raphson iteration in fixed point with caller-chosen precision, or a small LUT seed plus one Newton step. Closes the math gap behind items 2 and 3.
+
+#### Sequence and attention machinery (depend on item 10)
+
+44. `embedding_lookup` kind: a wrapper over `rom` indexed by token id. The SmolLM2 embedding is 49152 x 576 = 28M params — needs hierarchical BRAM emission (item 13) and per-row banking to be tractable.
+45. `rope_apply` kind: precomputed sin/cos ROMs indexed by position, complex rotation pair across head_dim/2. ROM contents bake in once at compile time from the model's `rope_theta` and `max_position_embeddings`.
+46. `causal_mask` kind: combinational, depends only on `(position, kv_position)`.
+47. `kv_cache` IR pattern: per-layer pair of writable BRAMs sized `(num_kv_heads, max_seq, head_dim)`, write port driven by the current token's K and V projections, read port driven by the attention loop. Re-uses the `--weight-bram` design sketched in `docs/DEFERRED.md` but for activations rather than weights.
+48. `multi_head_attention` composite kind: takes Q/K/V signals plus shape attrs `(num_q_heads, num_kv_heads, head_dim, max_seq)`, lowers to the masked-softmax * V construction. Depends on 10, 42, 46, 47.
+
+#### Decode loop
+
+49. Sampling kinds: `argmax`, `top_k`, `top_p`, `temperature_scale`. Argmax over a 49152-wide bus folds to a comparator tree.
+50. Autoregressive driver: a frontend variant whose external interface is `(token_id_in, valid_in) -> (token_id_out, valid_out)`, internal state carries the KV cache and the position counter. Built on the sequential-bitnet FSM pattern.
+
+#### Backend scale (mandatory at LM size)
+
+51. Replace `linear`'s inline-expression lowering with a parameterised matmul block instantiation. The current path emits one assign per output neuron with every input term inline — at 49152 x 576 (lm_head) that's tens of MB of Verilog text and no synthesis tool will accept it. Closely related to item 13 (module hierarchy).
+52. Vendor BRAM / DSP inference attributes on the matmul block so Vivado / Quartus / Yosys infer block RAM for weights and DSP cascades for the MAC tree. Generalises the existing `(* ram_style *)` plumbing in `rom`.
+
+#### Verification
+
+53. Tiny-LLaMA round-trip fixture: 1-layer model with hidden=8, num_heads=2, vocab=16, seq=4 (whose entire forward pass fits in iverilog in seconds), end-to-end through the LM frontend, cycle-accurate against the `transformers` fp32 reference for a handful of token sequences. Without this the LM frontend has no truth source.
+
+Categories (rough): items 1–11 are scoped-out features needing IR or frontend extensions; 12–17 are followups on existing surface area; 18–22 are docs/release polish; 23–26 are external validation; 27–37 are smaller architectural gaps; 38–53 are the language-model-support cluster, with 38, 39, 51, and the prerequisite item 10 as foundations.

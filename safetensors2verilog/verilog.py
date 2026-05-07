@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from .core import Gate, GateGraph
+from .core import Gate, GateGraph, RawSubmodule
 
 # ---- Identifier handling ----------------------------------------------------
 
@@ -616,6 +616,83 @@ def _lower_rom(ctx: EmitContext, g: Gate) -> list[str]:
     return lines
 
 
+@lowering("instance")
+def _lower_instance(ctx: EmitContext, g: Gate) -> list[str]:
+    """Black-box submodule instantiation.
+
+    The submodule must be present in ``GateGraph.submodules`` (either as a
+    nested ``GateGraph`` or as a ``RawSubmodule``); the backend emits all
+    submodules in the same Verilog file before this parent module.
+
+    attrs:
+      module_name         required str. The Verilog module name to instantiate.
+      instance_name       optional str. The instance identifier in the parent
+                          module. Defaults to ``<gate_name>_inst``.
+      input_ports         list[str] of submodule-side port names, parallel to
+                          ``g.inputs``. Each input is wired to the parent
+                          signal of the same index in ``g.inputs``.
+      output_port         str. The submodule-side port name that drives this
+                          Gate's output signal (named ``g.name``). The
+                          signal's width is ``g.output_width``.
+      extra_output_ports  optional list of (sub_port, parent_signal) tuples
+                          for submodules with multiple output ports beyond
+                          the primary. Each ``parent_signal`` must be
+                          declared in the parent — the canonical pattern is
+                          to add an ``extern_wire`` Gate whose ``name``
+                          matches the parent signal.
+      param_map           optional dict[str, int|str]. Verilog parameter
+                          overrides passed via ``#(.NAME(value), ...)`` on
+                          the instance.
+
+    Inputs may freely include external module ports, the special ``"clk"``
+    or ``"rst"`` strings, or any signal already produced earlier in the
+    parent's topological order.
+    """
+    module_name = g.attrs["module_name"]
+    instance_name = g.attrs.get("instance_name", ctx.name(g.name) + "_inst")
+    input_ports = list(g.attrs.get("input_ports", []))
+    output_port = g.attrs.get("output_port", "y")
+    extra_outputs = list(g.attrs.get("extra_output_ports", []))
+    param_map = g.attrs.get("param_map")
+
+    if len(input_ports) != len(g.inputs):
+        raise ValueError(
+            f"gate '{g.name}' kind 'instance': len(input_ports)="
+            f"{len(input_ports)} != len(inputs)={len(g.inputs)}"
+        )
+
+    conns: list[str] = []
+    for sub_port, parent_sig in zip(input_ports, g.inputs):
+        conns.append(f".{sub_port}({ctx.name(parent_sig)})")
+    conns.append(f".{output_port}({ctx.name(g.name)})")
+    for sub_port, parent_sig in extra_outputs:
+        conns.append(f".{sub_port}({ctx.name(parent_sig)})")
+
+    lines: list[str] = []
+    if param_map:
+        param_str = ", ".join(f".{k}({v})" for k, v in param_map.items())
+        lines.append(f"  {module_name} #({param_str}) {instance_name} (")
+    else:
+        lines.append(f"  {module_name} {instance_name} (")
+    lines.append("    " + ",\n    ".join(conns))
+    lines.append("  );")
+    return lines
+
+
+@lowering("extern_wire")
+def _lower_extern_wire(ctx: EmitContext, g: Gate) -> list[str]:
+    """A wire whose driver lives outside the dataflow gate-by-gate path.
+
+    Used in conjunction with ``instance`` gates whose ``extra_output_ports``
+    drive multiple parent signals (the primary one being ``Gate.name``,
+    additional ones being ``extern_wire`` gates so the backend's declared
+    set is kept consistent). Lowering emits nothing; the wire declaration
+    is produced by the standard internal-net pass using
+    ``g.output_width`` and ``g.output_signed``.
+    """
+    return []
+
+
 # ---- Top-level emit ---------------------------------------------------------
 
 
@@ -711,19 +788,49 @@ def emit_module(graph: GateGraph, target: str = "verilog",
     be either a constant sentinel ("#0", "#1"), an external input, or
     the output of an earlier gate. Module name and signal names are
     sanitized; collisions are resolved by appending '_u<N>'.
+
+    Submodule handling: ``graph.submodules`` may contain ``GateGraph``
+    or ``RawSubmodule`` entries. The backend emits each submodule (in
+    depth-first leaves-first order) before the parent in the same output
+    file, deduplicating by ``top`` name so a primitive used many times
+    appears once. ``RawSubmodule.text`` is emitted verbatim regardless of
+    ``target``; nested ``GateGraph`` submodules honor ``target`` for SV
+    rewrites.
     """
-    if target in ("sv", "systemverilog"):
-        text = _emit_module_internal(
-            graph, pack_buses=pack_buses, group_ports=group_ports
-        )
-        return _sv_translate(text)
-    if target != "verilog":
+    if target not in ("verilog", "sv", "systemverilog"):
         raise ValueError(
             f"unknown target '{target}'; valid: 'verilog', 'sv'"
         )
-    return _emit_module_internal(
+
+    seen: set[str] = set()
+    parts: list[str] = []
+
+    def _walk(g: GateGraph) -> None:
+        for sub in g.submodules:
+            if sub.top in seen:
+                continue
+            seen.add(sub.top)
+            if isinstance(sub, RawSubmodule):
+                parts.append(sub.text.rstrip() + "\n")
+            else:
+                _walk(sub)
+                inner = _emit_module_internal(
+                    sub, pack_buses=pack_buses, group_ports=group_ports
+                )
+                if target in ("sv", "systemverilog"):
+                    inner = _sv_translate(inner)
+                parts.append(inner.rstrip() + "\n")
+
+    _walk(graph)
+
+    parent = _emit_module_internal(
         graph, pack_buses=pack_buses, group_ports=group_ports
     )
+    if target in ("sv", "systemverilog"):
+        parent = _sv_translate(parent)
+    parts.append(parent)
+
+    return "\n".join(parts)
 
 
 def _sv_translate(verilog_text: str) -> str:

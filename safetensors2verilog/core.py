@@ -42,6 +42,19 @@ class Signal:
     is_parameter: if True, declared as a Verilog parameter rather than wire/reg
                   (used for compile-time constants exposed at the module port)
     parameter_value: integer default for parameter ports
+
+    Q-format annotation (informational; hardware operates on raw bits):
+      q_int_bits, q_frac_bits — fractional fixed-point split. The bit
+        pattern represents the value ``raw / 2**q_frac_bits``; total
+        ``width = (1 if signed else 0) + q_int_bits + q_frac_bits`` for a
+        canonical Q-format signal, but this is not enforced because some
+        carriers (matmul accumulators, packed buses) intentionally have
+        slack bits or pack heterogeneous elements. When both Q fields are
+        zero the signal is interpreted as a plain integer.
+      scale — dequantisation multiplier (a float64) recording the mapping
+        from the integer bit pattern to the original real-valued tensor.
+        Hardware does not consume ``scale``; downstream tooling, golden
+        models, and frontend authors use it to track quantisation error.
     """
     name: str
     width: int = 1
@@ -49,6 +62,9 @@ class Signal:
     direction: str = "auto"
     is_parameter: bool = False
     parameter_value: int = 0
+    q_int_bits: int = 0
+    q_frac_bits: int = 0
+    scale: float = 1.0
 
 
 @dataclass
@@ -82,15 +98,82 @@ class Gate:
 class GateGraph:
     """The frontend-produced IR the backend lowers to Verilog.
 
-    inputs:  external input ports (Signal: name + width + sign)
-    outputs: external output ports
-    gates:   dataflow nodes, must be topologically sorted
-    top:     module name in the generated Verilog
+    inputs:     external input ports (Signal: name + width + sign)
+    outputs:    external output ports
+    gates:      dataflow nodes, must be topologically sorted
+    top:        module name in the generated Verilog
+    submodules: additional GateGraphs to emit as separate Verilog modules
+                in the same output file. Each submodule's `top` becomes a
+                module name that the parent's gates may reference via the
+                ``instance`` kind. Used for hierarchical compilation
+                (matmul blocks, RMSNorm units, attention heads, etc.) so
+                that the parent module stays small while large repeated
+                primitives become reusable parameterized modules. Order
+                matters only insofar as nested ``instance`` references
+                must point at modules that appear earlier in the depth-
+                first traversal; the backend emits leaves first.
     """
     inputs: list[Signal]
     outputs: list[Signal]
     gates: list[Gate]
     top: str = "top"
+    submodules: list["GateGraph | RawSubmodule"] = field(default_factory=list)
+
+
+@dataclass
+class RawSubmodule:
+    """A pre-written Verilog module included verbatim alongside the parent.
+
+    Use this for parameterized templates (matmul block, RMSNorm unit,
+    attention head, etc.) whose IR-graph representation would be unwieldy
+    or whose synthesis behavior depends on direct vendor pragma placement.
+    The backend emits ``text`` verbatim before any module that instantiates
+    it via the ``instance`` IR kind.
+
+    top:           module name (must match the ``module`` keyword in ``text``)
+    text:          full Verilog source for the module, including ``module``
+                   / ``endmodule`` and any necessary `default_nettype
+                   directives.
+    sidecar_files: filename -> file contents map for any external files the
+                   module references (e.g. weight ROMs loaded via
+                   ``$readmemh``). Callers writing the emitted Verilog to
+                   disk should also write each sidecar file in the same
+                   directory; ``collect_sidecar_files(graph)`` walks a
+                   GateGraph tree and returns the merged map.
+    """
+    top: str
+    text: str
+    sidecar_files: dict[str, str] = field(default_factory=dict)
+
+
+def collect_sidecar_files(
+    graph: "GateGraph",
+) -> dict[str, str]:
+    """Walk ``graph.submodules`` recursively and merge every ``RawSubmodule``'s
+    ``sidecar_files`` into a single dict for the caller to write to disk.
+
+    Duplicate filenames across different RawSubmodules raise ValueError so
+    the caller doesn't silently lose ROM contents. Filenames are intended
+    to be unique per (module_name, role) combination — see the matmul block
+    factory for the canonical naming convention.
+    """
+    out: dict[str, str] = {}
+
+    def walk(g: "GateGraph") -> None:
+        for sub in g.submodules:
+            if isinstance(sub, RawSubmodule):
+                for fn, contents in sub.sidecar_files.items():
+                    if fn in out and out[fn] != contents:
+                        raise ValueError(
+                            f"sidecar filename collision: '{fn}' "
+                            f"(submodule '{sub.top}')"
+                        )
+                    out[fn] = contents
+            else:
+                walk(sub)
+
+    walk(graph)
+    return out
 
 
 # ---- Frontend abstraction ---------------------------------------------------

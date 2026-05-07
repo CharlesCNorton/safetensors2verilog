@@ -7,7 +7,9 @@ from .core import (
     FrontendOption,
     Gate,
     GateGraph,
+    RawSubmodule,
     Signal,
+    collect_sidecar_files,
     registry,
 )
 from .evaluate import evaluate_graph, step_graph
@@ -26,8 +28,10 @@ __all__ = [
     "FrontendOption",
     "Gate",
     "GateGraph",
+    "RawSubmodule",
     "Signal",
     "registry",
+    "collect_sidecar_files",
     "emit_module",
     "emit_bram_template",
     "emit_top_wrapper",
