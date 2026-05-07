@@ -715,6 +715,23 @@ class HFLlamaFrontend(Frontend):
                 default=DEFAULT_WEIGHT_BITS,
                 help="bit width of int weights (per-channel symmetric quant).",
             ),
+            FrontendOption(
+                name="max-seq-override",
+                type=int,
+                default=0,
+                help="override max_position_embeddings from config "
+                     "(0 = use config value). Useful for cutting "
+                     "max_seq down to a tractable size for iverilog "
+                     "testing on big models.",
+            ),
+            FrontendOption(
+                name="num-layers-override",
+                type=int,
+                default=0,
+                help="override num_hidden_layers from config "
+                     "(0 = use config value). Useful for compiling a "
+                     "subset of layers (the first N) for testing.",
+            ),
         ]
 
     def parse(
@@ -724,6 +741,8 @@ class HFLlamaFrontend(Frontend):
         config: str | None = None,
         activation_bits: int = DEFAULT_ACT_BITS,
         weight_bits: int = DEFAULT_WEIGHT_BITS,
+        max_seq_override: int = 0,
+        num_layers_override: int = 0,
         **options,
     ) -> GateGraph:
         path = Path(path)
@@ -736,6 +755,12 @@ class HFLlamaFrontend(Frontend):
                 f"config.json not found at {config_path}; pass --config PATH"
             )
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        if max_seq_override > 0:
+            cfg["max_position_embeddings"] = int(max_seq_override)
+        if num_layers_override > 0:
+            cfg["num_hidden_layers"] = min(
+                int(num_layers_override), int(cfg["num_hidden_layers"])
+            )
 
         state_dict: dict[str, torch.Tensor] = {}
         with safe_open(str(path), framework="pt") as f:

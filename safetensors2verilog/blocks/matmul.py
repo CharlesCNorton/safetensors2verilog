@@ -85,6 +85,8 @@ def matmul_seq_block(
     module_suffix: str = "",
     use_dsp: bool = True,
     use_block_ram: bool = True,
+    use_sidecar_hex: bool | None = None,
+    inline_threshold: int = 100_000,
 ) -> RawSubmodule:
     """Emit a Verilog matmul module computing y = W @ x + b.
 
@@ -163,14 +165,36 @@ def matmul_seq_block(
     ram_attr = '(* ram_style = "block" *) ' if use_block_ram else ""
     dsp_attr = '(* use_dsp = "yes" *) ' if use_dsp else ""
 
+    # Sidecar hex for large weight tables. The total weight count M*K is the
+    # right driver: above ``inline_threshold`` (default 100k) we emit one
+    # external .hex file per output ROM and use ``$readmemh`` to load it.
+    if use_sidecar_hex is None:
+        use_sidecar_hex = (M * K) > inline_threshold
+
+    sidecar_files: dict[str, str] = {}
+
     # Per-output blocks: ROM init, MAC, accumulator, slice into y_packed.
     per_output_blocks: list[str] = []
     for j in range(M):
-        rom_init = "\n".join(
-            f"    rom_{j}[{i}] = {weight_bits}'h"
-            f"{_signed_mask(weights[j][i], weight_bits):x};"
-            for i in range(K)
-        )
+        if use_sidecar_hex:
+            hex_filename = f"{module_name}_rom_{j}.hex"
+            hex_lines = "\n".join(
+                f"{_signed_mask(weights[j][i], weight_bits):x}"
+                for i in range(K)
+            )
+            sidecar_files[hex_filename] = hex_lines + "\n"
+            rom_init_block = (
+                f'  initial $readmemh("{hex_filename}", rom_{j});'
+            )
+        else:
+            rom_init_lines = "\n".join(
+                f"    rom_{j}[{i}] = {weight_bits}'h"
+                f"{_signed_mask(weights[j][i], weight_bits):x};"
+                for i in range(K)
+            )
+            rom_init_block = (
+                "  initial begin\n" + rom_init_lines + "\n  end"
+            )
         bias_lit = (
             f"{out_bits}'h{_signed_mask(biases[j], out_bits):x}"
         )
@@ -179,9 +203,7 @@ def matmul_seq_block(
           {ram_attr}reg signed [{weight_bits-1}:0] rom_{j} [0:{K-1}];
           reg signed [{out_bits-1}:0] acc_{j};
           {dsp_attr}wire signed [{act_bits+weight_bits-1}:0] prod_{j};
-          initial begin
-        {rom_init}
-          end
+        """) + rom_init_block + "\n" + dedent(f"""\
           assign prod_{j} = $signed(rom_{j}[counter]) * x_now;
           always @(posedge clk or posedge rst) begin
             if (rst)
@@ -271,7 +293,8 @@ def matmul_seq_block(
         `default_nettype wire
         """)
 
-    return RawSubmodule(top=module_name, text=text)
+    return RawSubmodule(top=module_name, text=text,
+                        sidecar_files=sidecar_files)
 
 
 def matmul_seq_invoke(
