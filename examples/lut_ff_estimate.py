@@ -48,6 +48,23 @@ def luts_for_fanin(f: int) -> int:
     return max(12, (f + 4) // 5)
 
 
+def yosys_calibrated_estimate(
+    verilog_path: Path, top: str,
+    yosys_path: str | None = None,
+) -> dict:
+    """Yosys-driven estimate.
+
+    The analytical model above (``luts_for_fanin``) is roughly an order of
+    magnitude off vs Yosys' actual cell count on the threshold-computer
+    8-bit family. This wrapper drives Yosys+ABC and returns the post-tech-
+    map cell count, which is what the README publishes for synthesis
+    numbers. Use the analytical model only when Yosys isn't available;
+    otherwise use this.
+    """
+    from safetensors2verilog.synth import run_synth
+    return run_synth(verilog_path, top=top, yosys=yosys_path)
+
+
 def gate_count_and_lut_estimate(path: Path):
     gates = 0
     total_fanin = 0

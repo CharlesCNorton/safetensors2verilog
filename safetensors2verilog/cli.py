@@ -56,17 +56,27 @@ def _graph_to_jsonable(graph: GateGraph) -> dict:
 def _emit_sdc_template(graph: GateGraph, period_ns: float) -> str:
     """Synopsys Design Constraints starter file for the given graph.
 
-    Produces a single clock at `period_ns`, per-port input / output delay
-    constraints (each port differentiated), and false-path declarations
-    on async resets when present. Excludes the clock and reset ports
-    themselves from the data-port delay sets.
+    Produces:
+      - one ``create_clock`` per distinct clock signal used by register
+        gates (multi-clock support),
+      - per-port input / output delay constraints (each port differentiated;
+        excludes clk and rst sets),
+      - false-path declarations between every pair of distinct clock
+        domains (so async-domain crossings don't break STA),
+      - false-path declarations on async resets.
+
+    Multiple clock domains are inferred via ``collect_clocks(graph)`` in
+    ``safetensors2verilog.verilog``.
     """
-    has_clk = any(s.name == "clk" for s in graph.inputs) or any(
-        g.kind == "register" for g in graph.gates
-    )
-    has_rst = any(s.name == "rst" for s in graph.inputs) or any(
-        g.kind == "register" and g.attrs.get("rst") for g in graph.gates
-    )
+    from .verilog import collect_clocks, collect_resets
+    clocks = sorted(collect_clocks(graph))
+    resets = sorted(collect_resets(graph))
+    has_register = any(g.kind == "register" for g in graph.gates)
+
+    # If no register gates declared a clk, but the design has 'clk' as an
+    # explicit input, fall back to that.
+    if not clocks and any(s.name == "clk" for s in graph.inputs):
+        clocks = ["clk"]
 
     in_delay = period_ns * 0.4
     out_delay = period_ns * 0.4
@@ -75,36 +85,64 @@ def _emit_sdc_template(graph: GateGraph, period_ns: float) -> str:
         f"# Module: {graph.top}",
         "",
     ]
-    if has_clk:
+    if not clocks and not has_register:
+        lines.append("# (no clock signals detected; SDC mostly empty)")
+        lines.append("")
+        return "\n".join(lines)
+
+    # ---- Clocks ----
+    primary_clk = clocks[0] if clocks else "clk"
+    for clk in clocks:
+        # Different clocks may belong to different domains; the user can
+        # adjust the period per clock as needed.
         lines.append(
-            f"create_clock -name clk -period {period_ns} [get_ports clk]"
-        )
-        lines.append("")
-        lines.append("# Per-port input delays (excludes clk and rst).")
-        excluded = {"clk", "rst"}
-        for s in graph.inputs:
-            if s.name in excluded or s.is_parameter:
-                continue
-            lines.append(
-                f"set_input_delay  -clock clk -max {in_delay:.2f} "
-                f"[get_ports {s.name}]"
-            )
-        lines.append("")
-        lines.append("# Per-port output delays.")
-        for s in graph.outputs:
-            lines.append(
-                f"set_output_delay -clock clk -max {out_delay:.2f} "
-                f"[get_ports {s.name}]"
-            )
-    else:
-        lines.append("# (no clk port detected; SDC mostly empty)")
-    if has_rst:
-        lines.append("")
-        lines.append("# Asynchronous reset; do not analyze its timing")
-        lines.append(
-            "set_false_path -from [get_ports rst] -to [all_registers]"
+            f"create_clock -name {clk} -period {period_ns} [get_ports {clk}]"
         )
     lines.append("")
+
+    # ---- Per-port input / output delays (anchored to the primary clock) ----
+    lines.append(
+        f"# Per-port I/O delays (anchored to primary clock '{primary_clk}')."
+    )
+    excluded = set(clocks) | set(resets) | {"rst"}
+    for s in graph.inputs:
+        if s.name in excluded or s.is_parameter:
+            continue
+        lines.append(
+            f"set_input_delay  -clock {primary_clk} -max {in_delay:.2f} "
+            f"[get_ports {s.name}]"
+        )
+    for s in graph.outputs:
+        lines.append(
+            f"set_output_delay -clock {primary_clk} -max {out_delay:.2f} "
+            f"[get_ports {s.name}]"
+        )
+    lines.append("")
+
+    # ---- Cross-clock-domain false paths ----
+    if len(clocks) > 1:
+        lines.append("# Cross-clock-domain false paths (no STA across boundaries).")
+        for i, ci in enumerate(clocks):
+            for cj in clocks[i+1:]:
+                lines.append(
+                    f"set_false_path -from [get_clocks {ci}] "
+                    f"-to [get_clocks {cj}]"
+                )
+                lines.append(
+                    f"set_false_path -from [get_clocks {cj}] "
+                    f"-to [get_clocks {ci}]"
+                )
+        lines.append("")
+
+    # ---- Async resets ----
+    if resets:
+        lines.append("# Asynchronous resets; do not analyze their timing.")
+        for r in resets:
+            lines.append(
+                f"set_false_path -from [get_ports {r}] -to [all_registers]"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -266,14 +304,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="safetensors2verilog",
         description="Compile safetensors-stored networks to synthesis-ready Verilog.",
-        # allow_abbrev=False prevents argparse's prefix-matching from
-        # treating frontend flags like ``--pipeline`` as abbreviations of
-        # global flags like ``--pipeline-every``. Without this, the user's
-        # ``--pipeline`` (a bool on bitnet_linear) was being interpreted as
-        # ``--pipeline-every`` (an int) and failing with "expected one
-        # argument". Same shape of collision will surface as the LM
-        # frontend's ``--skip-lm-head`` / ``--max-seq-override`` /
-        # ``--num-layers-override`` options grow.
+        # Disable argparse prefix matching so frontend flags like
+        # ``--pipeline`` can't be silently rebound to ``--pipeline-every``.
         allow_abbrev=False,
     )
     parser.add_argument(

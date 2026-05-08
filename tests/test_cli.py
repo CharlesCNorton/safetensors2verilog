@@ -105,7 +105,11 @@ def test_emit_sdc_writes_starter_constraints():
         assert sdc.exists()
         text = sdc.read_text()
         # No clk in this trivial graph (combinational), so SDC notes that
-        assert "no clk port detected" in text or "create_clock" in text
+        assert (
+            "no clock signals detected" in text
+            or "no clk port detected" in text
+            or "create_clock" in text
+        )
 
 
 def test_target_sv_emits_systemverilog():

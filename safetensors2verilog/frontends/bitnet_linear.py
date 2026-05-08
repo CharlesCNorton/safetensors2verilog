@@ -490,6 +490,50 @@ class BitNetLinearFrontend(Frontend):
                 ),
             ),
             FrontendOption(
+                name="parallelism",
+                type=int,
+                default=0,
+                help=(
+                    "sequential-mode --parallelism N: time-multiplex "
+                    "outputs to trade latency for area. With N < "
+                    "out_size[L], the layer reuses N MAC units across "
+                    "ceil(out_size[L]/N) output groups. 0 means full "
+                    "parallelism (one MAC per output, current default)."
+                ),
+            ),
+            FrontendOption(
+                name="streaming-input",
+                type=bool,
+                default=False,
+                help=(
+                    "sequential-mode --streaming-input: replace the "
+                    "per-input port bank with a single x port plus "
+                    "valid_in / ready_out handshake, plus an internal "
+                    "in_buf register file that fills before COMPUTE."
+                ),
+            ),
+            FrontendOption(
+                name="handshake",
+                type=bool,
+                default=False,
+                help=(
+                    "sequential-mode --handshake: full valid_out + "
+                    "ready_in protocol on the output side. DONE state "
+                    "holds outputs valid until ready_in fires."
+                ),
+            ),
+            FrontendOption(
+                name="weight-bram",
+                type=bool,
+                default=False,
+                help=(
+                    "sequential-mode --weight-bram: replace the per-"
+                    "output ROMs with writable BRAMs and expose "
+                    "weight_addr / weight_data / weight_we ports for "
+                    "runtime weight reload."
+                ),
+            ),
+            FrontendOption(
                 name="sequential",
                 type=bool,
                 default=False,
@@ -513,6 +557,10 @@ class BitNetLinearFrontend(Frontend):
         output_clamp: str | None = None,
         pipeline: bool = False,
         sequential: bool = False,
+        parallelism: int = 0,
+        streaming_input: bool = False,
+        handshake: bool = False,
+        weight_bram: bool = False,
         **options,
     ) -> GateGraph:
         if pipeline and sequential:
@@ -520,6 +568,36 @@ class BitNetLinearFrontend(Frontend):
                 "--pipeline and --sequential are mutually exclusive; "
                 "sequential mode is already inherently pipelined "
                 "(one input per cycle into shared MAC hardware)."
+            )
+
+        # Sequential-bitnet variants are surfaced in --help so users can
+        # see them, but refuse a non-default value with a clear pointer
+        # to the design rather than silently ignoring it. The
+        # architectural changes for each variant are documented in
+        # docs/DEFERRED.md.
+        if parallelism not in (0,):
+            raise NotImplementedError(
+                "--parallelism N is exposed but the FSM rewiring for "
+                "time-multiplexed output groups isn't landed yet. See "
+                "docs/DEFERRED.md ('--parallelism N: time-multiplex "
+                "outputs')."
+            )
+        if streaming_input:
+            raise NotImplementedError(
+                "--streaming-input needs an in_buf register file plus "
+                "valid_in/ready_out plus an FSM IDLE_FILL state. See "
+                "docs/DEFERRED.md ('--streaming-input')."
+            )
+        if handshake:
+            raise NotImplementedError(
+                "--handshake needs a 4-state FSM with VALID_WAITING. "
+                "See docs/DEFERRED.md ('--handshake')."
+            )
+        if weight_bram:
+            raise NotImplementedError(
+                "--weight-bram needs a writable bram IR kind (or rom "
+                "with write attrs) plus weight_addr/data/we ports. "
+                "See docs/DEFERRED.md ('--weight-bram')."
             )
 
         clamp_range = _parse_clamp_arg(output_clamp)

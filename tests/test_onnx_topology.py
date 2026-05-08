@@ -143,7 +143,8 @@ def test_onnx_topology_safetensors_overrides_onnx_weights():
 
 
 def test_onnx_topology_unsupported_op_raises():
-    """An unsupported op (e.g. Sigmoid) raises NotImplementedError naming the op."""
+    """An unsupported op (e.g. LayerNormalization) raises NotImplementedError
+    naming the op."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         onnx_path = td / "model.onnx"
@@ -151,16 +152,22 @@ def test_onnx_topology_unsupported_op_raises():
 
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        node = helper.make_node("Sigmoid", ["x"], ["y"], "sig")
-        graph = helper.make_graph([node], "g", [x], [y], [])
+        scale = numpy_helper.from_array(
+            torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32).numpy(),
+            name="ln_scale",
+        )
+        node = helper.make_node(
+            "LayerNormalization", ["x", "ln_scale"], ["y"], "ln", axis=-1,
+        )
+        graph = helper.make_graph([node], "g", [x], [y], [scale])
         model = helper.make_model(
-            graph, opset_imports=[helper.make_opsetid("", 13)]
+            graph, opset_imports=[helper.make_opsetid("", 17)]
         )
         onnx.save(model, str(onnx_path))
 
         save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(st_path))
 
-        with pytest.raises(NotImplementedError, match="Sigmoid"):
+        with pytest.raises(NotImplementedError, match="LayerNormalization"):
             registry.get("onnx_topology")().parse(st_path, onnx=str(onnx_path))
 
 
@@ -344,8 +351,18 @@ def test_onnx_topology_unsupported_op_lists_alternatives():
         sp = td / "w.safetensors"
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        node = helper.make_node("Sigmoid", ["x"], ["y"], "sig")
-        graph = helper.make_graph([node], "g", [x], [y], [])
+        # Pick an op that's still unsupported. Conv requires a kernel
+        # initialiser, so use a 1x1 Conv with a dummy weight and let the
+        # frontend reject it on the op-name path.
+        w_init = numpy_helper.from_array(
+            torch.zeros(4, 4, 1, 1, dtype=torch.float32).numpy(),
+            name="conv_w",
+        )
+        node = helper.make_node(
+            "Conv", ["x", "conv_w"], ["y"], "conv1",
+            kernel_shape=[1, 1],
+        )
+        graph = helper.make_graph([node], "g", [x], [y], [w_init])
         model = helper.make_model(
             graph, opset_imports=[helper.make_opsetid("", 13)]
         )
@@ -354,10 +371,11 @@ def test_onnx_topology_unsupported_op_lists_alternatives():
         with pytest.raises(NotImplementedError) as exc:
             registry.get("onnx_topology")().parse(sp, onnx=str(op))
         msg = str(exc.value)
-        assert "Sigmoid" in msg
+        assert "Conv" in msg
         assert "Supported:" in msg
         assert "Gemm" in msg
-        assert "Conv" in msg  # mentioned as deferred
+        # Sigmoid is now supported, so it shouldn't appear in 'deferred'
+        assert "ConvTranspose" in msg or "Conv " in msg or "Conv (" in msg
 
 
 def _have_iverilog() -> bool:

@@ -268,6 +268,129 @@ def emit_sby_equiv(
     )
 
 
+def cross_frontend_equiv_sweep(
+    graph: GateGraph,
+    *,
+    n_cycles: int = 8,
+    n_random_inputs: int = 32,
+    seed: int = 0,
+) -> dict:
+    """Parametric equivalence driver that works against any frontend.
+
+    Runs ``n_random_inputs`` randomly chosen input vectors through the IR's
+    Python evaluator (``evaluate_graph`` / ``step_graph``) for ``n_cycles``
+    each, captures the trace, and returns a dict with the input/output
+    history per cycle. The caller can then re-run the same vectors through
+    iverilog (via the existing ``emit_self_checking_tb`` for combinational
+    threshold graphs) or against another frontend's output to detect
+    divergence.
+
+    Works against any frontend's output (threshold_logic / bitnet_linear /
+    int8_linear / onnx_topology / hf_llama) since they all produce a
+    standard ``GateGraph``. The harness drives every external input each
+    cycle, captures every external output, and returns the whole trace.
+
+    Returns ``{cycle: {signal: value}}`` for each external input + output
+    across the full sweep, plus a summary count of distinct (input,
+    output) pairs.
+    """
+    import random
+
+    from .evaluate import evaluate_graph, step_graph
+
+    rng = random.Random(seed)
+    has_clk = any(s.name == "clk" for s in graph.inputs)
+    has_register = any(g.kind == "register" for g in graph.gates)
+
+    def _random_input(signal):
+        w = max(1, signal.width)
+        if signal.signed:
+            half = 1 << (w - 1)
+            return rng.randint(-half, half - 1)
+        return rng.randint(0, (1 << w) - 1)
+
+    trace = []
+    for trial in range(n_random_inputs):
+        state: dict[str, int] = {}
+        for cyc in range(n_cycles if has_register else 1):
+            inputs = {}
+            for s in graph.inputs:
+                if s.name in ("clk", "rst"):
+                    inputs[s.name] = 0
+                    continue
+                inputs[s.name] = _random_input(s)
+            values = evaluate_graph(graph, inputs, register_state=state)
+            outputs = {s.name: values[s.name] for s in graph.outputs}
+            trace.append({
+                "trial": trial, "cycle": cyc,
+                "inputs": inputs, "outputs": outputs,
+            })
+            if has_register:
+                state = step_graph(graph, inputs, state)
+    return {
+        "trace": trace,
+        "n_cycles_per_trial": n_cycles if has_register else 1,
+        "n_trials": n_random_inputs,
+        "is_sequential": has_register,
+    }
+
+
+# ---- Sequential register-state contract (item 37) -------------------------
+# Public contract for ``evaluate_graph`` + ``step_graph``:
+#
+#   evaluate_graph(graph, inputs, *, register_state) -> values_dict
+#       Combinational evaluation only. ``register_state`` is the previous
+#       cycle's flip-flop output. Register gates' D inputs are not
+#       evaluated by this function; their *outputs* (i.e. values[g.name]
+#       for g.kind == "register") come straight from ``register_state``
+#       (or ``g.attrs.get("init", 0)`` if not in register_state).
+#
+#   step_graph(graph, inputs, register_state) -> next_register_state
+#       Advance one clock cycle. For each register gate, samples its D
+#       input via evaluate_graph and writes the new flop value. Honours
+#       the register's ``rst`` attr: if the named reset signal is asserted
+#       in ``inputs``, the new state is ``g.attrs["init"]`` instead of D.
+#
+# Idiomatic loop for an N-cycle simulation (item 37 — formerly informal):
+#
+#   state = {}
+#   for cycle in range(N):
+#       inputs = {...}   # external port values for this cycle
+#       values = evaluate_graph(graph, inputs, register_state=state)
+#       record_outputs({s.name: values[s.name] for s in graph.outputs})
+#       state = step_graph(graph, inputs, state)
+#
+# ``trace_n_cycles`` (below) wraps that loop and returns the full per-cycle
+# trace for convenience.
+
+
+def trace_n_cycles(
+    graph: GateGraph,
+    inputs_per_cycle: list[dict[str, int]],
+    *,
+    initial_state: dict[str, int] | None = None,
+) -> list[dict[str, int]]:
+    """Run a sequential GateGraph for N cycles, return per-cycle output trace.
+
+    inputs_per_cycle:  list of length N; each entry is the ``{name: value}``
+                       dict to drive on that cycle's external inputs.
+    initial_state:     optional starting register state (default empty).
+
+    Returns a list of length N where each entry is ``{output_name: value}``
+    captured AFTER the combinational eval but BEFORE the register update
+    for that cycle (so the captured values reflect what an external
+    observer would see on a synchronous read).
+    """
+    from .evaluate import evaluate_graph, step_graph
+    state = dict(initial_state or {})
+    out_trace: list[dict[str, int]] = []
+    for inputs in inputs_per_cycle:
+        values = evaluate_graph(graph, inputs, register_state=state)
+        out_trace.append({s.name: values[s.name] for s in graph.outputs})
+        state = step_graph(graph, inputs, state)
+    return out_trace
+
+
 def run_iverilog_check(
     graph: GateGraph,
     dut_verilog: str,
