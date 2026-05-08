@@ -59,7 +59,7 @@ def evaluate_graph(
     inputs: dict[str, int],
     *,
     register_state: dict[str, int] | None = None,
-) -> dict[str, int]:
+) -> dict[str, int | None]:
     """Evaluate every signal in `graph` given external `inputs`.
 
     Returns a dict mapping every signal name (external inputs, internal
@@ -74,7 +74,9 @@ def evaluate_graph(
     widths, signed, gate_by_name = _build_signal_info(graph)
     register_state = register_state or {}
 
-    values: dict[str, int] = {"#0": 0, "#1": 1}
+    # ``int | None`` because tristate gates return None for high-Z; the
+    # value is otherwise an integer.
+    values: dict[str, int | None] = {"#0": 0, "#1": 1}
     for s in graph.inputs:
         if s.name not in inputs and s.is_parameter:
             values[s.name] = s.parameter_value
@@ -139,18 +141,46 @@ def step_graph(
         if rst is not None and values.get(rst, 0):
             next_state[g.name] = int(g.attrs.get("init", 0))
         else:
-            next_state[g.name] = _mask(values[d], widths[g.name], signed[g.name])
+            d_val = values[d]
+            if d_val is None:
+                # D input is high-impedance: hold the previous state.
+                next_state[g.name] = register_state.get(
+                    g.name, int(g.attrs.get("init", 0))
+                )
+            else:
+                next_state[g.name] = _mask(
+                    d_val, widths[g.name], signed[g.name]
+                )
     return next_state
 
 
 def _eval_gate(
     g: Gate,
-    values: dict[str, int],
+    values: dict[str, int | None],
     widths: dict[str, int],
     signed: dict[str, bool],
-) -> int:
+) -> int | None:
     kind = g.kind
-    inps = [values[s] for s in g.inputs]
+    inps_raw: list[int | None] = [values[s] for s in g.inputs]
+
+    # Tristate handles None on its data input as Z passthrough; everything
+    # else propagates Z (None) on any input to a None output.
+    if kind == "tristate":
+        if len(inps_raw) != 2:
+            raise ValueError(
+                f"gate '{g.name}' kind 'tristate' expects [data, en]"
+            )
+        ts_data = inps_raw[0]
+        ts_en = inps_raw[1]
+        if ts_en is None:
+            return None
+        enable_high = bool(g.attrs.get("enable_high", True))
+        en_active = (ts_en != 0) if enable_high else (ts_en == 0)
+        return ts_data if en_active else None
+
+    if any(v is None for v in inps_raw):
+        return None
+    inps: list[int] = [int(v) for v in inps_raw if v is not None]
 
     if kind == "threshold":
         weights = list(g.attrs.get("weights", []))
@@ -215,10 +245,10 @@ def _eval_gate(
 
     if kind == "mux":
         sel = inps[0]
-        data = inps[1:]
-        if 0 <= sel < len(data):
-            return data[sel]
-        return data[-1]
+        mux_data = inps[1:]
+        if 0 <= sel < len(mux_data):
+            return mux_data[sel]
+        return mux_data[-1]
 
     if kind == "eq":
         return 1 if inps[0] == inps[1] else 0
@@ -239,15 +269,8 @@ def _eval_gate(
             return init[addr] if addr < len(init) else 0
         return 0
 
-    if kind == "tristate":
-        # When the enable signal is asserted, drive the data through.
-        # Otherwise return ``None`` to mark the bus as high-impedance;
-        # downstream consumers must treat ``None`` as "don't read" or
-        # propagate it. (The previous behaviour returned 0 unconditionally,
-        # which silently hid Z propagation bugs in cross-checks.)
-        enable_high = bool(g.attrs.get("enable_high", True))
-        en_active = (inps[1] != 0) if enable_high else (inps[1] == 0)
-        return inps[0] if en_active else None
+    # ``tristate`` is handled at the top of this function so its data
+    # input can pass through None (Z) without being filtered.
 
     raise NotImplementedError(
         f"evaluate_graph does not implement kind '{kind}' "

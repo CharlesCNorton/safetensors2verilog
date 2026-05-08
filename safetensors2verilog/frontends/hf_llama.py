@@ -257,7 +257,10 @@ def build_llama_graph(
     assert HID % H == 0
     D = HID // H   # head_dim
 
-    submodules: list[RawSubmodule] = []
+    # Submodules accumulated as a list of RawSubmodule (the LM frontend
+    # only emits raw-text submodules). Typed as the GateGraph union so
+    # the constructor accepts it without an invariance cast.
+    submodules: list["GateGraph | RawSubmodule"] = []
     gates: list[Gate] = []
 
     # ---- Embedding ----

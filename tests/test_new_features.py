@@ -264,6 +264,47 @@ def test_onnx_topology_sigmoid_emits_instance_gate():
         assert any(t.startswith("sigmoid_lut") for t in sub_tops)
 
 
+def test_emit_sva_assertions_register_reset():
+    """Emit SVA assertions for a graph with a register + reset and check
+    the output module wires up the reset and init invariant."""
+    from safetensors2verilog.core import Gate, GateGraph, Signal
+    from safetensors2verilog.equivalence import emit_sva_assertions
+    g = GateGraph(
+        inputs=[Signal("clk"), Signal("rst"), Signal("d", width=4)],
+        outputs=[Signal("q", width=4)],
+        gates=[Gate(name="q", kind="register", inputs=["d"],
+                    attrs={"clk": "clk", "rst": "rst", "init": 0},
+                    output_width=4)],
+        top="t",
+    )
+    sva = emit_sva_assertions(g)
+    # Module name + bind hint
+    assert "module t_assertions" in sva
+    assert "bind t t_assertions u_assert" in sva
+    # Register reset assertion + cover
+    assert "assert_reset_q" in sva
+    assert "cover_reset_q" in sva
+    assert "rst |=> (q == 4'd0)" in sva
+
+
+def test_emit_sva_assertions_mux_select_range():
+    """A mux with N data ports asserts the select stays in [0, N-1]."""
+    from safetensors2verilog.core import Gate, GateGraph, Signal
+    from safetensors2verilog.equivalence import emit_sva_assertions
+    g = GateGraph(
+        inputs=[Signal("sel", width=2),
+                Signal("a", width=4), Signal("b", width=4),
+                Signal("c", width=4)],
+        outputs=[Signal("y", width=4)],
+        gates=[Gate(name="y", kind="mux",
+                    inputs=["sel", "a", "b", "c"], output_width=4)],
+        top="m",
+    )
+    sva = emit_sva_assertions(g)
+    assert "assume_mux_y" in sva
+    assert "(sel < 3)" in sva
+
+
 def test_onnx_topology_layernorm_emits_block_with_clock():
     """ONNX LayerNormalization wires through a layer_norm_block instance
     and adds clk/rst/start to the parent's external port list."""
