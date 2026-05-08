@@ -50,7 +50,6 @@ Recently shipped (not in this list):
 ## Open
 
 1. Build the verilator simulator binary for the 30-layer SmolLM2 module and drive a real prompt through it, capturing the predicted next token.
-2. Build verilator binaries at 2 and 4 layers and confirm each produces a plausible token for a fixed prompt.
-3. Run `emit_vivado_tcl` output through Vivado and check in the resulting utilization + timing reports.
-4. Run `emit_quartus_qsf` output through `quartus_sh -t` and check in the fit + STA reports.
-5. Run `emit_synopsys_dc_tcl` output through `dc_shell` and check in the area + timing reports.
+2. Run `emit_vivado_tcl` output through Vivado and check in the resulting utilization + timing reports.
+3. Run `emit_quartus_qsf` output through `quartus_sh -t` and check in the fit + STA reports.
+4. Run `emit_synopsys_dc_tcl` output through `dc_shell` and check in the area + timing reports.
