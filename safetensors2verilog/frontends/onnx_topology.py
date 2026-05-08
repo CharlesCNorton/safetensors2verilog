@@ -157,13 +157,33 @@ class OnnxTopologyFrontend(Frontend):
         if not graph_inputs:
             raise ValueError("ONNX graph has no non-initializer inputs")
 
-        # Each non-initializer input becomes its own bank of ports.
+        # Validate + flatten input shapes. We accept 1-D, 2-D (batch=1,
+        # features), and 4-D NCHW (batch=1) for convolutional inputs.
+        # 4-D inputs are flattened to (H * W * C) elements in row-major
+        # (h, w, c) order to match the conv2d primitive's expected
+        # x_packed layout. Mutate graph_inputs in place so downstream
+        # iterations see the flattened shape.
+        flattened: list[tuple[str, list[int]]] = []
         for in_name, in_shape in graph_inputs:
-            if not in_shape or len(in_shape) > 2:
+            if not in_shape:
+                raise NotImplementedError(
+                    f"input '{in_name}' has empty shape"
+                )
+            if len(in_shape) == 4:
+                if in_shape[0] != 1:
+                    raise NotImplementedError(
+                        f"input '{in_name}' shape {in_shape}: only "
+                        f"batch=1 supported"
+                    )
+                _, in_c, in_hh, in_ww = in_shape
+                in_shape = [in_hh * in_ww * in_c]
+            elif len(in_shape) > 2:
                 raise NotImplementedError(
                     f"input '{in_name}' has shape {in_shape}; "
-                    f"only 1-D or 2-D-with-batch=1 supported"
+                    f"supported: 1-D, 2-D (batch=1, features), or 4-D NCHW"
                 )
+            flattened.append((in_name, in_shape))
+        graph_inputs = flattened
 
         # ---- IR construction ----
         gates: list[Gate] = []
@@ -594,27 +614,35 @@ class OnnxTopologyFrontend(Frontend):
                 val_widths[outs[0]] = obits
                 val_signed[outs[0]] = True
 
-            elif op in ("Sigmoid", "Exp"):
+            elif op in ("Sigmoid", "Exp", "Tanh"):
                 # Per-element LUT-based activation. The hardware blocks live
-                # in safetensors2verilog.blocks.{sigmoid,exp} and are
+                # in safetensors2verilog.blocks.{sigmoid,exp,tanh} and are
                 # parameterised by (in_bits, out_bits, q_frac_bits). One
                 # instance per element; the backend dedups the module by
-                # shape-canonical name.
-                from ..blocks.sigmoid import sigmoid_block
+                # shape-canonical name. Sigmoid output is unsigned Q0.out;
+                # Exp output is unsigned Q0.out; Tanh output is signed
+                # Q1.(out-1) over [-1, 1).
                 from ..blocks.exp import exp_block
+                from ..blocks.sigmoid import sigmoid_block
+                from ..blocks.tanh import tanh_block
                 if op == "Sigmoid":
                     sub = sigmoid_block(in_bits=8, out_bits=8,
                                          in_q_frac_bits=4)
-                else:
+                    out_w, out_signed = 8, False
+                elif op == "Exp":
                     sub = exp_block(in_bits=8, out_bits=12,
                                      in_q_frac_bits=4)
+                    out_w, out_signed = 12, False
+                else:  # Tanh
+                    sub = tanh_block(in_bits=8, out_bits=8,
+                                      in_q_frac_bits=4)
+                    out_w, out_signed = 8, True
                 # Stash the submodule on a side channel that ``parse``'s
                 # caller consumes (we attach it to a dedicated list on the
                 # graph after the loop; see end of this function).
                 _onnx_pending_submodules.append(sub)
                 in_sigs = val_signals[ins[0]]
                 in_w = val_widths[ins[0]]
-                out_w = 8 if op == "Sigmoid" else 12
                 label = node.name or f"{op.lower()}_{len(gates)}"
                 out_sigs = []
                 for i, sig in enumerate(in_sigs):
@@ -635,27 +663,569 @@ class OnnxTopologyFrontend(Frontend):
                             "instance_name": f"{label.replace('.', '_')}_{i}",
                             "input_ports": ["x"], "output_port": "y",
                         },
-                        output_width=out_w, output_signed=False,
+                        output_width=out_w, output_signed=out_signed,
                     ))
                     out_sigs.append(out_name)
                 val_signals[outs[0]] = out_sigs
                 val_widths[outs[0]] = out_w
+                val_signed[outs[0]] = out_signed
+
+            elif op == "Softmax":
+                # ONNX Softmax: y = exp(x - max(x)) / sum(exp(x - max(x))).
+                # Lowered to a single softmax_block instance. Pack the
+                # per-element signal list into x_packed, drive a constant
+                # all-ones mask (no causal mask in the standalone op),
+                # instance the block, then slice y_packed back into
+                # per-element signals.
+                from ..blocks.softmax import softmax_block
+                attrs = {a.name: a for a in node.attribute}
+                axis = int(attrs["axis"].i) if "axis" in attrs else -1
+                in_sigs = val_signals[ins[0]]
+                K = len(in_sigs)
+                in_w = val_widths[ins[0]]
+                if in_w != 8:
+                    raise NotImplementedError(
+                        f"Softmax expects 8-bit signed inputs; got {in_w}-bit. "
+                        f"Insert an explicit requantize."
+                    )
+                if axis not in (-1, 1):
+                    raise NotImplementedError(
+                        f"Softmax node '{node.name}': axis={axis}; only the "
+                        f"trailing axis (axis=-1 or 1 with batch=1) is "
+                        f"supported under the 1-D IR."
+                    )
+                sm_sub, exp_sub = softmax_block(K=K, abits=in_w, obits=8)
+                _onnx_pending_submodules.append(exp_sub)
+                _onnx_pending_submodules.append(sm_sub)
+                _needs_clock = True
+
+                # Pack per-element scalars into x_packed (LSB-first).
+                label = node.name or f"softmax_{len(gates)}"
+                pack_name = f"{label}_x_packed"
+                gates.append(Gate(
+                    name=pack_name, kind="concat",
+                    inputs=list(reversed(in_sigs)),
+                    output_width=K * in_w, output_signed=False,
+                ))
+                # Constant all-ones mask (no positions zeroed).
+                mask_name = f"{label}_mask"
+                gates.append(Gate(
+                    name=mask_name, kind="constant",
+                    attrs={"value": (1 << K) - 1},
+                    output_width=K, output_signed=False,
+                ))
+                # extern_wire for done + the instance.
+                done_name = f"{label}_done"
+                gates.append(Gate(
+                    name=done_name, kind="extern_wire", output_width=1,
+                ))
+                y_pack_name = f"{label}_y_packed"
+                gates.append(Gate(
+                    name=y_pack_name, kind="instance",
+                    inputs=["clk", "rst", "start", pack_name, mask_name],
+                    attrs={
+                        "module_name": sm_sub.top,
+                        "instance_name": label.replace(".", "_") + "_inst",
+                        "input_ports": ["clk", "rst", "start", "x_packed", "mask"],
+                        "output_port": "y_packed",
+                        "extra_output_ports": [("done", done_name)],
+                    },
+                    output_width=K * 8, output_signed=False,
+                ))
+                # Slice y_packed back into per-element unsigned 8-bit signals.
+                out_sigs = []
+                for k in range(K):
+                    sname = f"{label}.{k}"
+                    gates.append(Gate(
+                        name=sname, kind="slice",
+                        inputs=[y_pack_name],
+                        attrs={"hi": (k + 1) * 8 - 1, "lo": k * 8},
+                        output_width=8, output_signed=False,
+                    ))
+                    out_sigs.append(sname)
+                val_signals[outs[0]] = out_sigs
+                val_widths[outs[0]] = 8
                 val_signed[outs[0]] = False
 
-            elif op == "Tanh":
-                # tanh(x) = 2*sigmoid(2x) - 1. For first cut, lower to:
-                #   sigmoid_lut over 2x's clamped range, output unsigned 8b,
-                #   then map back to signed via 2*y - 256 (Q1.7 signed).
-                # This is approximate but works for typical activation
-                # ranges. A native tanh LUT is item 3's full deliverable.
+            elif op == "Conv":
+                # ONNX Conv (NCHW): X is [batch, in_c, in_h, in_w]; W is
+                # [out_c, in_c/groups, kH, kW]; optional B is [out_c].
+                # We require batch=1, groups=1, dilations=1, symmetric pads.
+                attrs = {a.name: a for a in node.attribute}
+                kernel_shape = list(attrs["kernel_shape"].ints) if "kernel_shape" in attrs else None
+                strides = list(attrs["strides"].ints) if "strides" in attrs else [1, 1]
+                pads = list(attrs["pads"].ints) if "pads" in attrs else [0, 0, 0, 0]
+                dilations = list(attrs["dilations"].ints) if "dilations" in attrs else [1, 1]
+                groups = int(attrs["group"].i) if "group" in attrs else 1
+                if dilations != [1, 1]:
+                    raise NotImplementedError(
+                        f"Conv node '{node.name}': dilations {dilations} != "
+                        f"[1, 1] not supported"
+                    )
+                if groups != 1:
+                    raise NotImplementedError(
+                        f"Conv node '{node.name}': group={groups}; only "
+                        f"group=1 supported"
+                    )
+                if pads[0] != pads[2] or pads[1] != pads[3]:
+                    raise NotImplementedError(
+                        f"Conv node '{node.name}': asymmetric pads {pads}"
+                    )
+                pad_h, pad_w = int(pads[0]), int(pads[1])
+                stride_h, stride_w = int(strides[0]), int(strides[1])
+
+                W_name = ins[1]
+                if W_name not in initializers:
+                    raise NotImplementedError(
+                        f"Conv node '{node.name}': weight '{W_name}' must "
+                        f"be an initializer (dynamic weights not supported)"
+                    )
+                W = initializers[W_name]
+                if W.dim() != 4:
+                    raise ValueError(
+                        f"Conv node '{node.name}': weight is not 4-D"
+                    )
+                out_c, in_c, kH, kW = W.shape
+                if kernel_shape is not None and kernel_shape != [kH, kW]:
+                    raise ValueError(
+                        f"Conv node '{node.name}': kernel_shape attr "
+                        f"{kernel_shape} != weight ({kH}, {kW})"
+                    )
+                if not _is_integer_tensor(W):
+                    raise ValueError(
+                        f"Conv node '{node.name}': weights are not "
+                        f"integer-valued"
+                    )
+                weights_lol = [
+                    [[[int(round(float(W[oc, ic_, ki, kj]))) for kj in range(kW)]
+                      for ki in range(kH)]
+                     for ic_ in range(in_c)]
+                    for oc in range(out_c)
+                ]
+                biases_l: list[int] = [0] * out_c
+                if len(ins) >= 3 and ins[2] in initializers:
+                    B = initializers[ins[2]]
+                    if B.numel() != out_c:
+                        raise ValueError(
+                            f"Conv node '{node.name}': bias length "
+                            f"{B.numel()} != out_c {out_c}"
+                        )
+                    biases_l = [int(round(float(v)))
+                                for v in B.flatten().tolist()]
+
+                x_name = ins[0]
+                x_sigs = val_signals[x_name]
+                in_w_bits = val_widths[x_name]
+                expected_in_elems = len(x_sigs)
+                if expected_in_elems % in_c != 0:
+                    raise ValueError(
+                        f"Conv node '{node.name}': input element count "
+                        f"{expected_in_elems} not divisible by in_c={in_c}"
+                    )
+                spatial = expected_in_elems // in_c
+                in_h_guess = int(spatial ** 0.5)
+                if in_h_guess * in_h_guess == spatial:
+                    in_h_in, in_w_in = in_h_guess, in_h_guess
+                else:
+                    raise NotImplementedError(
+                        f"Conv node '{node.name}': non-square implicit "
+                        f"input ({spatial} elements / {in_c} channels). "
+                        f"Reshape to square upstream or extend the frontend "
+                        f"to read explicit (H, W) shape from value_info."
+                    )
+                out_h_calc = (in_h_in + 2 * pad_h - kH) // stride_h + 1
+                out_w_calc = (in_w_in + 2 * pad_w - kW) // stride_w + 1
+                out_bits = max(in_w_bits, weight_bits) + max(
+                    1, (in_c * kH * kW).bit_length()
+                ) + 1
+
+                label = node.name or f"conv_{len(gates)}"
+                pack_name = f"{label}_x_packed"
+                gates.append(Gate(
+                    name=pack_name, kind="concat",
+                    inputs=list(reversed(x_sigs)),
+                    output_width=expected_in_elems * in_w_bits,
+                    output_signed=False,
+                ))
+                conv_name = f"{label}_y_packed"
+                gates.append(Gate(
+                    name=conv_name, kind="conv2d",
+                    inputs=[pack_name],
+                    attrs={
+                        "in_h": in_h_in, "in_w": in_w_in, "in_c": in_c,
+                        "out_h": out_h_calc, "out_w": out_w_calc,
+                        "out_c": out_c,
+                        "kH": kH, "kW": kW,
+                        "stride_h": stride_h, "stride_w": stride_w,
+                        "pad_h": pad_h, "pad_w": pad_w,
+                        "weights": weights_lol,
+                        "biases": biases_l,
+                        "act_bits": in_w_bits,
+                        "weight_bits": weight_bits,
+                        "out_bits": out_bits,
+                    },
+                    output_width=out_h_calc * out_w_calc * out_c * out_bits,
+                    output_signed=True,
+                ))
+                conv_out_sigs = []
+                for k in range(out_h_calc * out_w_calc * out_c):
+                    sn = f"{label}.{k}"
+                    gates.append(Gate(
+                        name=sn, kind="slice",
+                        inputs=[conv_name],
+                        attrs={"hi": (k + 1) * out_bits - 1,
+                               "lo": k * out_bits},
+                        output_width=out_bits, output_signed=True,
+                    ))
+                    conv_out_sigs.append(sn)
+                val_signals[outs[0]] = conv_out_sigs
+                val_widths[outs[0]] = out_bits
+                val_signed[outs[0]] = True
+
+            elif op == "ConvTranspose":
                 raise NotImplementedError(
-                    f"ONNX Tanh not yet wired through the LUT path; the "
-                    f"underlying hardware block is straightforward "
-                    f"(mirror of sigmoid_block with tanh contents) but a "
-                    f"dedicated tanh_block hasn't been authored yet. "
-                    f"Workaround: replace Tanh with 2*Sigmoid(2*x)-1 in "
-                    f"the ONNX graph upstream."
+                    f"ConvTranspose node '{node.name}': transposed "
+                    f"convolution is not yet wired through the conv2d "
+                    f"primitive. Workaround: replace ConvTranspose with "
+                    f"the equivalent forward Conv plus an upsample."
                 )
+
+            elif op == "BatchNormalization":
+                # Inference-only BatchNorm: bakes the running statistics
+                # into a per-channel affine ``y = a * x + b`` where
+                # a = scale / sqrt(var + eps) and b = bias - mean * a.
+                # Inputs in the ONNX op order: X, scale, bias,
+                # running_mean, running_var (5 total).
+                if len(ins) != 5:
+                    raise NotImplementedError(
+                        f"BatchNormalization node '{node.name}': expected "
+                        f"5 inputs (X, scale, bias, mean, var), got {len(ins)}"
+                    )
+                attrs = {a.name: a for a in node.attribute}
+                eps = float(attrs["epsilon"].f) if "epsilon" in attrs else 1e-5
+                if "momentum" in attrs:
+                    # Inference doesn't use momentum; ignore.
+                    pass
+                if "training_mode" in attrs and bool(attrs["training_mode"].i):
+                    raise NotImplementedError(
+                        f"BatchNormalization node '{node.name}': "
+                        f"training_mode=1 not supported (inference only)."
+                    )
+                for nm in ins[1:]:
+                    if nm not in initializers:
+                        raise NotImplementedError(
+                            f"BatchNormalization node '{node.name}': "
+                            f"input '{nm}' must be an initializer "
+                            f"(running stats baked in)"
+                        )
+                scale = initializers[ins[1]].to(torch.float32)
+                bias_t = initializers[ins[2]].to(torch.float32)
+                mean = initializers[ins[3]].to(torch.float32)
+                var = initializers[ins[4]].to(torch.float32)
+                # Effective per-channel multiplier and offset.
+                a_eff = scale / torch.sqrt(var + eps)
+                b_eff = bias_t - mean * a_eff
+                # Quantise to integers using a uniform scaling factor.
+                # The frontend's accumulator widths grow per layer; we
+                # round a_eff to int and apply it as a `linear` per
+                # element (caller is responsible for upstream activation
+                # scaling making this round well).
+                a_int = a_eff.round().clamp(
+                    -(1 << (weight_bits - 1)) + 1,
+                    (1 << (weight_bits - 1)) - 1,
+                ).to(torch.int32).tolist()
+                b_int = b_eff.round().clamp(
+                    -(1 << (val_widths[ins[0]] - 1)) * 256,
+                    (1 << (val_widths[ins[0]] - 1)) * 256,
+                ).to(torch.int32).tolist()
+                in_sigs = val_signals[ins[0]]
+                if len(a_int) != len(in_sigs):
+                    raise NotImplementedError(
+                        f"BatchNormalization node '{node.name}': scale "
+                        f"length {len(a_int)} != input length "
+                        f"{len(in_sigs)}; only per-element BN supported"
+                    )
+                in_w = val_widths[ins[0]]
+                out_w = in_w + weight_bits + 1
+                label = node.name or f"bn_{len(gates)}"
+                out_sigs = []
+                for i, sig in enumerate(in_sigs):
+                    sn = f"{label}.{i}"
+                    gates.append(Gate(
+                        name=sn, kind="linear",
+                        inputs=[sig],
+                        attrs={"weights": [int(a_int[i])],
+                               "bias": int(b_int[i])},
+                        output_width=out_w, output_signed=True,
+                    ))
+                    out_sigs.append(sn)
+                val_signals[outs[0]] = out_sigs
+                val_widths[outs[0]] = out_w
+                val_signed[outs[0]] = True
+
+            elif op == "GroupNormalization":
+                # GroupNorm with G groups along the channel axis: split
+                # the input into G groups of size K/G, layer-norm each
+                # independently with a per-group gamma slice, concatenate.
+                from ..blocks.layer_norm import layer_norm_block
+                attrs = {a.name: a for a in node.attribute}
+                num_groups = int(attrs["num_groups"].i) if "num_groups" in attrs else 1
+                eps = float(attrs["epsilon"].f) if "epsilon" in attrs else 1e-5
+                if len(ins) < 3:
+                    raise NotImplementedError(
+                        f"GroupNormalization node '{node.name}': expected "
+                        f"3 inputs (X, scale, bias), got {len(ins)}"
+                    )
+                scale = initializers[ins[1]].to(torch.float32)
+                bias_t = initializers[ins[2]].to(torch.float32)
+
+                in_sigs = val_signals[ins[0]]
+                K = len(in_sigs)
+                if K % num_groups != 0:
+                    raise ValueError(
+                        f"GroupNormalization node '{node.name}': K={K} "
+                        f"not divisible by num_groups={num_groups}"
+                    )
+                K_per_group = K // num_groups
+                if scale.numel() != K:
+                    raise ValueError(
+                        f"GroupNormalization node '{node.name}': scale "
+                        f"length {scale.numel()} != K={K}"
+                    )
+                in_w = val_widths[ins[0]]
+                if in_w != 8:
+                    raise NotImplementedError(
+                        f"GroupNormalization node '{node.name}': only "
+                        f"8-bit signed inputs supported"
+                    )
+                _needs_clock = True
+                label = node.name or f"gn_{len(gates)}"
+                all_out_sigs: list[str] = []
+                for gi in range(num_groups):
+                    g_lo = gi * K_per_group
+                    g_hi = g_lo + K_per_group
+                    g_in = in_sigs[g_lo:g_hi]
+                    g_scale = scale[g_lo:g_hi]
+                    g_bias = bias_t[g_lo:g_hi]
+                    gamma_int = [
+                        max(-(1 << 15),
+                            min((1 << 15) - 1,
+                                int(round(float(v) * (1 << 14)))))
+                        for v in g_scale.flatten().tolist()
+                    ]
+                    beta_int = [
+                        max(-(1 << 15),
+                            min((1 << 15) - 1, int(round(float(v)))))
+                        for v in g_bias.flatten().tolist()
+                    ]
+                    ln, rsq = layer_norm_block(
+                        K=K_per_group, gamma_int=gamma_int,
+                        beta_int=beta_int,
+                        abits=8, obits=8, eps=eps,
+                    )
+                    _onnx_pending_submodules.append(ln)
+                    _onnx_pending_submodules.append(rsq)
+                    pack = f"{label}.g{gi}_x_packed"
+                    gates.append(Gate(
+                        name=pack, kind="concat",
+                        inputs=list(reversed(g_in)),
+                        output_width=K_per_group * 8, output_signed=False,
+                    ))
+                    done_n = f"{label}.g{gi}_done"
+                    gates.append(Gate(name=done_n, kind="extern_wire",
+                                      output_width=1))
+                    yp = f"{label}.g{gi}_y_packed"
+                    gates.append(Gate(
+                        name=yp, kind="instance",
+                        inputs=["clk", "rst", "start", pack],
+                        attrs={
+                            "module_name": ln.top,
+                            "instance_name": (
+                                f"{label.replace('.', '_')}_g{gi}"
+                            ),
+                            "input_ports": ["clk", "rst", "start", "x_packed"],
+                            "output_port": "y_packed",
+                            "extra_output_ports": [("done", done_n)],
+                        },
+                        output_width=K_per_group * 8, output_signed=True,
+                    ))
+                    for k in range(K_per_group):
+                        sn = f"{label}.g{gi}_{k}"
+                        gates.append(Gate(
+                            name=sn, kind="slice",
+                            inputs=[yp],
+                            attrs={"hi": (k + 1) * 8 - 1, "lo": k * 8},
+                            output_width=8, output_signed=True,
+                        ))
+                        all_out_sigs.append(sn)
+                val_signals[outs[0]] = all_out_sigs
+                val_widths[outs[0]] = 8
+                val_signed[outs[0]] = True
+
+            elif op == "Attention":
+                # Scaled dot-product attention as a composite of per-pair
+                # linear scores, per-row softmax_block instances, and
+                # per-element linear outputs. Minimal supported form:
+                # 3-input (Q, K, V), single-head, batch=1, no mask, no
+                # past_key/value. The hf_llama frontend covers transformer
+                # attention end-to-end with full multi-head + KV cache;
+                # this branch is for ONNX models that lay out attention
+                # via the standalone op rather than decomposed MatMul +
+                # Softmax + MatMul.
+                from ..blocks.softmax import softmax_block
+                if len(ins) > 3:
+                    raise NotImplementedError(
+                        f"Attention node '{node.name}': mask / past_key / "
+                        f"past_value inputs (len(ins)={len(ins)}) not yet "
+                        f"supported; only the (Q, K, V) form."
+                    )
+                attrs = {a.name: a for a in node.attribute}
+                num_heads = int(attrs["num_heads"].i) if "num_heads" in attrs else 1
+                if num_heads != 1:
+                    raise NotImplementedError(
+                        f"Attention node '{node.name}': num_heads="
+                        f"{num_heads}; only single-head supported. Use "
+                        f"the hf_llama frontend for multi-head attention."
+                    )
+                q_sigs = val_signals[ins[0]]
+                k_sigs = val_signals[ins[1]]
+                v_sigs = val_signals[ins[2]]
+                in_w = val_widths[ins[0]]
+                if (val_widths[ins[1]] != in_w
+                        or val_widths[ins[2]] != in_w):
+                    raise NotImplementedError(
+                        f"Attention node '{node.name}': Q/K/V widths "
+                        f"differ"
+                    )
+                qn, kn, vn = len(q_sigs), len(k_sigs), len(v_sigs)
+                if qn != kn:
+                    raise NotImplementedError(
+                        f"Attention node '{node.name}': Q has {qn} "
+                        f"elements, K has {kn}; require seq*d_k equal."
+                    )
+                seq_guess = int(qn ** 0.5)
+                if seq_guess * seq_guess == qn:
+                    seq, d_k = seq_guess, seq_guess
+                else:
+                    seq, d_k = 1, qn
+                if vn % seq != 0:
+                    raise NotImplementedError(
+                        f"Attention node '{node.name}': V has {vn} "
+                        f"elements, not divisible by seq={seq}"
+                    )
+                d_v = vn // seq
+
+                label = node.name or f"attn_{len(gates)}"
+                score_width = in_w * 2 + max(1, (d_k - 1).bit_length()) + 1
+                score_sigs: list[list[str]] = []
+                for i in range(seq):
+                    row = []
+                    for j in range(seq):
+                        prod_names = []
+                        for kk in range(d_k):
+                            pn = f"{label}.prod_{i}_{j}_{kk}"
+                            gates.append(Gate(
+                                name=pn, kind="mul",
+                                inputs=[q_sigs[i * d_k + kk],
+                                        k_sigs[j * d_k + kk]],
+                                output_width=2 * in_w, output_signed=True,
+                            ))
+                            prod_names.append(pn)
+                        sn = f"{label}.score_{i}_{j}"
+                        gates.append(Gate(
+                            name=sn, kind="linear",
+                            inputs=prod_names,
+                            attrs={"weights": [1] * d_k, "bias": 0},
+                            output_width=score_width, output_signed=True,
+                        ))
+                        row.append(sn)
+                    score_sigs.append(row)
+
+                # Per-row softmax instance.
+                _needs_clock = True
+                sm_sub, exp_sub = softmax_block(K=seq, abits=8, obits=8)
+                _onnx_pending_submodules.append(exp_sub)
+                _onnx_pending_submodules.append(sm_sub)
+                weight_outs: list[list[str]] = []
+                for i in range(seq):
+                    truncated = []
+                    for j in range(seq):
+                        tn = f"{label}.score_trunc_{i}_{j}"
+                        gates.append(Gate(
+                            name=tn, kind="slice",
+                            inputs=[score_sigs[i][j]],
+                            attrs={"hi": 7, "lo": 0},
+                            output_width=8, output_signed=True,
+                        ))
+                        truncated.append(tn)
+                    pack = f"{label}.scorerow_{i}_packed"
+                    gates.append(Gate(
+                        name=pack, kind="concat",
+                        inputs=list(reversed(truncated)),
+                        output_width=seq * 8, output_signed=False,
+                    ))
+                    mask_n = f"{label}.mask_{i}"
+                    gates.append(Gate(
+                        name=mask_n, kind="constant",
+                        attrs={"value": (1 << seq) - 1},
+                        output_width=seq, output_signed=False,
+                    ))
+                    done_n = f"{label}.sm_done_{i}"
+                    gates.append(Gate(name=done_n, kind="extern_wire",
+                                      output_width=1))
+                    yp = f"{label}.weights_{i}_packed"
+                    gates.append(Gate(
+                        name=yp, kind="instance",
+                        inputs=["clk", "rst", "start", pack, mask_n],
+                        attrs={
+                            "module_name": sm_sub.top,
+                            "instance_name": (
+                                f"{label.replace('.', '_')}_sm_{i}"
+                            ),
+                            "input_ports": ["clk", "rst", "start",
+                                             "x_packed", "mask"],
+                            "output_port": "y_packed",
+                            "extra_output_ports": [("done", done_n)],
+                        },
+                        output_width=seq * 8, output_signed=False,
+                    ))
+                    row_w = []
+                    for j in range(seq):
+                        wn = f"{label}.w_{i}_{j}"
+                        gates.append(Gate(
+                            name=wn, kind="slice",
+                            inputs=[yp],
+                            attrs={"hi": (j + 1) * 8 - 1, "lo": j * 8},
+                            output_width=8, output_signed=False,
+                        ))
+                        row_w.append(wn)
+                    weight_outs.append(row_w)
+
+                out_width = 8 + in_w + max(1, (seq - 1).bit_length()) + 1
+                output_sigs: list[str] = []
+                for i in range(seq):
+                    for kv in range(d_v):
+                        prod_names = []
+                        for j in range(seq):
+                            pn = f"{label}.outprod_{i}_{kv}_{j}"
+                            gates.append(Gate(
+                                name=pn, kind="mul",
+                                inputs=[weight_outs[i][j],
+                                        v_sigs[j * d_v + kv]],
+                                output_width=8 + in_w, output_signed=True,
+                            ))
+                            prod_names.append(pn)
+                        sn = f"{label}.{i * d_v + kv}"
+                        gates.append(Gate(
+                            name=sn, kind="linear",
+                            inputs=prod_names,
+                            attrs={"weights": [1] * seq, "bias": 0},
+                            output_width=out_width, output_signed=True,
+                        ))
+                        output_sigs.append(sn)
+                val_signals[outs[0]] = output_sigs
+                val_widths[outs[0]] = out_width
+                val_signed[outs[0]] = True
 
             elif op == "Identity":
                 # Pass-through: alias the output name to the input's signals.
@@ -675,17 +1245,15 @@ class OnnxTopologyFrontend(Frontend):
 
             else:
                 supported = (
-                    "Gemm, MatMul, Add, Sub, Mul, Relu, Sigmoid, Exp, "
-                    "Identity, Constant, Reshape, Concat, Split, Gather"
+                    "Gemm, MatMul, Conv, Attention (single-head, no mask), "
+                    "BatchNormalization (inference, baked stats), "
+                    "GroupNormalization, Add, Sub, Mul, Relu, Sigmoid, "
+                    "Exp, Tanh, Softmax, Identity, Constant, Reshape, "
+                    "Concat, Split, Gather, LayerNormalization"
                 )
                 deferred = (
-                    "Conv, ConvTranspose (need 2-D windowed access), "
-                    "LayerNorm, GroupNorm, BatchNorm (need fixed-point "
-                    "sqrt/divide), Softmax, Tanh (need dedicated LUT "
-                    "blocks; Tanh = 2*Sigmoid(2x)-1 as workaround), "
-                    "Attention (composite of softmax + matmul; the "
-                    "hf_llama frontend in safetensors2verilog.frontends "
-                    "covers transformer attention end-to-end)"
+                    "ConvTranspose (transposed convolution; the conv2d "
+                    "IR primitive handles forward conv only)"
                 )
                 raise NotImplementedError(
                     f"ONNX op '{op}' (node '{node.name}') not supported by "

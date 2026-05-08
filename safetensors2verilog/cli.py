@@ -514,6 +514,49 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--emit-instantiation", type=Path, default=None, metavar="PATH",
+        help=(
+            "alongside the main output, write a Verilog instantiation "
+            "template for the emitted module: a paste-ready '<module> "
+            "u_inst (.port(parent_signal), ...)' snippet that the user "
+            "drops into a wrapper. Useful when a frontend produces a "
+            "parameterised module the user instantiates several times."
+        ),
+    )
+    parser.add_argument(
+        "--emit-multi", type=Path, default=None, metavar="DIR",
+        help=(
+            "use Frontend.parse_multi to enumerate every top module the "
+            "frontend exports, and write one <top>.v file per returned "
+            "graph under DIR. Most frontends still emit a single graph; "
+            "frontends that override parse_multi (multi-circuit, "
+            "multi-head-export, etc.) get one .v per top. Mutually "
+            "exclusive with -o."
+        ),
+    )
+    parser.add_argument(
+        "--sidecar-layout", choices=["flat", "subdirs", "tarball"],
+        default=None,
+        help=(
+            "when the frontend emits sidecar weight ROMs (matmul / "
+            "embedding / streaming-matmul), write them under --output's "
+            "parent directory using one of three layouts: 'flat' (legacy; "
+            "all hex files alongside the .v), 'subdirs' (recommended at "
+            "scale: per-module subdirectory), or 'tarball' (one tar archive "
+            "next to the .v, no individual files extracted). A "
+            "manifest.json is written in either case mapping submodule -> "
+            "sidecar file list. Without this flag, sidecar files are not "
+            "auto-written."
+        ),
+    )
+    parser.add_argument(
+        "--sidecar-tarball", type=Path, default=None, metavar="PATH",
+        help=(
+            "when --sidecar-layout=tarball, the path of the output archive. "
+            "Defaults to <output>.sidecars.tar."
+        ),
+    )
+    parser.add_argument(
         "--circuit", action="append", default=None, metavar="PREFIX",
         help=(
             "extract a single named circuit (with dependency closure) "
@@ -631,9 +674,26 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(e))
             return 2
 
+    if args.emit_multi is not None and args.output is not None:
+        parser.error("--emit-multi and -o are mutually exclusive")
+        return 2
+
     frontend = frontend_cls()
     try:
-        graph = frontend.parse(parse_path, top=args.top, **fe_kwargs)
+        if args.emit_multi is not None:
+            graphs = frontend.parse_multi(
+                parse_path, top=args.top, **fe_kwargs
+            )
+            if not graphs:
+                parser.error("frontend.parse_multi returned no graphs")
+                return 2
+            # Pick the first as the "primary" graph for downstream
+            # operations (--report, --inspect, --equiv-check) that need a
+            # single graph reference; --emit-multi writes all of them.
+            graph = graphs[0]
+        else:
+            graph = frontend.parse(parse_path, top=args.top, **fe_kwargs)
+            graphs = [graph]
     finally:
         if cleanup_temp is not None:
             import shutil
@@ -693,7 +753,27 @@ def main(argv: list[str] | None = None) -> int:
             if header:
                 text = header + text
 
-    if args.output is None:
+    if args.emit_multi is not None:
+        args.emit_multi.mkdir(parents=True, exist_ok=True)
+        for sub_graph in graphs:
+            sub_text = emit_module(
+                sub_graph, target=args.target,
+                pack_buses=args.pack_buses,
+                group_ports=args.group_ports,
+            )
+            if args.metadata_passthrough:
+                header = _render_metadata_header(args.input)
+                if header:
+                    sub_text = header + sub_text
+            ext = ".sv" if args.target == "sv" else ".v"
+            out_path = args.emit_multi / f"{sub_graph.top}{ext}"
+            out_path.write_text(sub_text, encoding="utf-8")
+            _info(
+                f"wrote {out_path} ({len(sub_graph.gates)} gates, "
+                f"{len(sub_graph.inputs)} inputs, "
+                f"{len(sub_graph.outputs)} outputs)"
+            )
+    elif args.output is None:
         sys.stdout.write(text)
     else:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -703,6 +783,25 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(graph.inputs)} inputs, {len(graph.outputs)} outputs)"
         )
 
+    if args.sidecar_layout is not None and args.output is not None:
+        from .core import write_sidecar_files
+        sidecar_dir = args.output.parent
+        tarball_path = (
+            args.sidecar_tarball
+            if args.sidecar_tarball is not None
+            else args.output.with_suffix(args.output.suffix + ".sidecars.tar")
+        )
+        stats = write_sidecar_files(
+            graph, sidecar_dir,
+            layout=args.sidecar_layout,
+            tarball_path=tarball_path if args.sidecar_layout == "tarball" else None,
+        )
+        _info(
+            f"wrote {stats['files']} sidecar file(s) across "
+            f"{stats['modules']} module(s) ({stats['bytes']/1024:.1f} KB) "
+            f"using layout '{args.sidecar_layout}'"
+        )
+
     if args.emit_sdc is not None:
         sdc_text = _emit_sdc_template(graph, args.sdc_period_ns)
         args.emit_sdc.parent.mkdir(parents=True, exist_ok=True)
@@ -710,6 +809,16 @@ def main(argv: list[str] | None = None) -> int:
         _info(
             f"wrote {args.emit_sdc} (SDC, "
             f"{args.sdc_period_ns} ns clock period)"
+        )
+
+    if args.emit_instantiation is not None:
+        from .verilog import emit_instantiation_template
+        snippet = emit_instantiation_template(graph)
+        args.emit_instantiation.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_instantiation.write_text(snippet, encoding="utf-8")
+        _info(
+            f"wrote {args.emit_instantiation} (instantiation template "
+            f"for {graph.top})"
         )
 
     if args.equiv_check:

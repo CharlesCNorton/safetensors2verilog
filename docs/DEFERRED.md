@@ -27,7 +27,7 @@ The `onnx_topology` frontend supports `Gemm`, `MatMul`, `Add`, `Sub`, `Mul`, `Re
 
 - **Conv, ConvTranspose**: need 2-D windowed access (see above).
 - **LayerNorm, GroupNorm, BatchNorm**: need fixed-point sqrt and divide. These are doable via lookup tables or iterative algorithms (Newton's method), but the IR has no fixed-point primitive; adding one means defining the format (Q-format, scale, bias) and a small library of fixed-point ops.
-- **Softmax, Sigmoid, Tanh, Exp**: need fixed-point transcendentals. Same blocker as the norms.
+- **Softmax**: the underlying `softmax_block` exists, but it expects a packed K-element bus and the ONNX path emits one signal per element; needs the pack / instance / slice adapter pattern that `LayerNormalization` already uses. (`Sigmoid`, `Exp`, and `Tanh` are now wired through `sigmoid_block` / `exp_block` / `tanh_block` per-element instances.)
 - **Attention**: composite of softmax + matmul over batched tensors; depends on the above plus batched primitives.
 
 The path forward for any of these is the same: pick a fixed-point format, add the necessary primitive kinds (`fp_sqrt`, `fp_div`, `fp_exp`, `lut`), and either inline the algorithm in the frontend or expose a single composite IR kind with a complete lowering. The choice is a real design decision and deserves its own session.

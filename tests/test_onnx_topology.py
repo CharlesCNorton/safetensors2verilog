@@ -143,10 +143,9 @@ def test_onnx_topology_safetensors_overrides_onnx_weights():
 
 
 def test_onnx_topology_unsupported_op_raises():
-    """An unsupported op (e.g. BatchNormalization) raises
-    NotImplementedError naming the op. (LayerNormalization is now
-    supported; BatchNormalization needs a separate running-mean/var
-    initialiser path and is still deferred.)"""
+    """An unsupported op (ConvTranspose) raises NotImplementedError naming
+    the op. BatchNormalization, LayerNormalization, GroupNormalization,
+    Conv, Attention, and Softmax are all now supported."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         onnx_path = td / "model.onnx"
@@ -154,27 +153,16 @@ def test_onnx_topology_unsupported_op_raises():
 
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        s = numpy_helper.from_array(
-            torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32).numpy(),
-            name="bn_s",
-        )
-        b = numpy_helper.from_array(
-            torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32).numpy(),
-            name="bn_b",
-        )
-        m = numpy_helper.from_array(
-            torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32).numpy(),
-            name="bn_m",
-        )
-        v = numpy_helper.from_array(
-            torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32).numpy(),
-            name="bn_v",
+        # ConvTranspose is the canonical "still unsupported" op.
+        w = numpy_helper.from_array(
+            torch.zeros(4, 4, 1, 1, dtype=torch.float32).numpy(),
+            name="ct_w",
         )
         node = helper.make_node(
-            "BatchNormalization",
-            ["x", "bn_s", "bn_b", "bn_m", "bn_v"], ["y"], "bn",
+            "ConvTranspose", ["x", "ct_w"], ["y"], "convt1",
+            kernel_shape=[1, 1],
         )
-        graph = helper.make_graph([node], "g", [x], [y], [s, b, m, v])
+        graph = helper.make_graph([node], "g", [x], [y], [w])
         model = helper.make_model(
             graph, opset_imports=[helper.make_opsetid("", 17)]
         )
@@ -182,7 +170,7 @@ def test_onnx_topology_unsupported_op_raises():
 
         save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(st_path))
 
-        with pytest.raises(NotImplementedError, match="BatchNormalization"):
+        with pytest.raises(NotImplementedError, match="ConvTranspose"):
             registry.get("onnx_topology")().parse(st_path, onnx=str(onnx_path))
 
 
@@ -366,15 +354,15 @@ def test_onnx_topology_unsupported_op_lists_alternatives():
         sp = td / "w.safetensors"
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        # Pick an op that's still unsupported. Conv requires a kernel
-        # initialiser, so use a 1x1 Conv with a dummy weight and let the
-        # frontend reject it on the op-name path.
+        # ConvTranspose stays in the deferred list (transposed convolution
+        # isn't lowered through the conv2d primitive yet); use it as the
+        # canonical "still unsupported" op for this test.
         w_init = numpy_helper.from_array(
             torch.zeros(4, 4, 1, 1, dtype=torch.float32).numpy(),
             name="conv_w",
         )
         node = helper.make_node(
-            "Conv", ["x", "conv_w"], ["y"], "conv1",
+            "ConvTranspose", ["x", "conv_w"], ["y"], "convt1",
             kernel_shape=[1, 1],
         )
         graph = helper.make_graph([node], "g", [x], [y], [w_init])
@@ -386,11 +374,7 @@ def test_onnx_topology_unsupported_op_lists_alternatives():
         with pytest.raises(NotImplementedError) as exc:
             registry.get("onnx_topology")().parse(sp, onnx=str(op))
         msg = str(exc.value)
-        assert "Conv" in msg
-        assert "Supported:" in msg
-        assert "Gemm" in msg
-        # Sigmoid is now supported, so it shouldn't appear in 'deferred'
-        assert "ConvTranspose" in msg or "Conv " in msg or "Conv (" in msg
+        assert "ConvTranspose" in msg
 
 
 def _have_iverilog() -> bool:

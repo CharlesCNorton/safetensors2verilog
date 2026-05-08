@@ -269,6 +269,59 @@ def _eval_gate(
             return init[addr] if addr < len(init) else 0
         return 0
 
+    if kind == "conv2d":
+        a = g.attrs
+        in_h = int(a["in_h"]); in_w = int(a["in_w"]); in_c = int(a["in_c"])
+        out_h = int(a["out_h"]); out_w = int(a["out_w"]); out_c = int(a["out_c"])
+        kH = int(a["kH"]); kW = int(a["kW"])
+        stride_h = int(a.get("stride_h", 1))
+        stride_w = int(a.get("stride_w", 1))
+        pad_h = int(a.get("pad_h", 0))
+        pad_w = int(a.get("pad_w", 0))
+        act_bits = int(a["act_bits"])
+        out_bits = int(a["out_bits"])
+        weights = a["weights"]
+        biases = a.get("biases") or [0] * out_c
+        x_packed = inps[0] & ((1 << (in_h * in_w * in_c * act_bits)) - 1)
+
+        def x_at(ih: int, iw: int, ic: int) -> int:
+            if not (0 <= ih < in_h and 0 <= iw < in_w):
+                return 0
+            in_idx = (ih * in_w + iw) * in_c + ic
+            lo = in_idx * act_bits
+            v = (x_packed >> lo) & ((1 << act_bits) - 1)
+            if v & (1 << (act_bits - 1)):
+                v -= (1 << act_bits)
+            return v
+
+        out_packed = 0
+        for oh in range(out_h):
+            for ow in range(out_w):
+                for oc in range(out_c):
+                    s = int(biases[oc])
+                    for ic in range(in_c):
+                        for ki in range(kH):
+                            ih_ = oh * stride_h - pad_h + ki
+                            for kj in range(kW):
+                                iw_ = ow * stride_w - pad_w + kj
+                                s += int(weights[oc][ic][ki][kj]) * x_at(ih_, iw_, ic)
+                    out_idx = (oh * out_w + ow) * out_c + oc
+                    mask = (1 << out_bits) - 1
+                    out_packed |= (s & mask) << (out_idx * out_bits)
+        return out_packed
+
+    if kind == "ram_writable":
+        # Combinational eval: read from the init contents only. Writes
+        # require step_graph + register state, which would need a separate
+        # state-bag for RAM contents (deferred); the read path is enough
+        # for the equivalence harness's combinational sweeps.
+        read_addr = inps[0]
+        init = list(g.attrs.get("init", []))
+        depth = int(g.attrs["depth"])
+        if 0 <= read_addr < depth:
+            return init[read_addr] if read_addr < len(init) else 0
+        return 0
+
     # ``tristate`` is handled at the top of this function so its data
     # input can pass through None (Z) without being filtered.
 

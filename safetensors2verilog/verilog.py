@@ -106,17 +106,28 @@ def _signal_decl(
 
 
 class EmitContext:
-    """State threaded into per-gate lowering functions."""
+    """State threaded into per-gate lowering functions.
+
+    target:  "verilog" (default) or "sv". When "sv", lowerings that have
+             SV-specific idioms (``unique case``, ``always_ff``,
+             ``always_comb``) emit those directly. Lowerings that don't
+             differ between the two targets ignore the field.
+    """
 
     def __init__(
         self,
         sigmap: dict[str, str],
         widths: dict[str, int],
         signed: dict[str, bool],
+        target: str = "verilog",
     ):
         self.sigmap = sigmap
         self.widths = widths
         self.signed = signed
+        self.target = target
+
+    def is_sv(self) -> bool:
+        return self.target in ("sv", "systemverilog")
 
     def name(self, sig: str) -> str:
         """Resolve a signal name to its Verilog identifier or constant literal."""
@@ -415,10 +426,16 @@ def _lower_mux(ctx: EmitContext, g: Gate) -> list[str]:
         for i in range(len(data) - 2, -1, -1):
             expr = f"({sel} == {i}) ? {ctx.name(data[i])} : ({expr})"
         return [f"  assign {ctx.name(g.name)} = {expr};"]
-    # case form for larger muxes
+    # case form for larger muxes; SV gets `always_comb` + `unique case`
+    # which lets the synth tool assume single-active-branch and infer a
+    # priority-encoded LUT instead of conservative case logic.
     out = ctx.name(g.name)
-    lines = ["  always @(*) begin"]
-    lines.append(f"    case ({sel})")
+    if ctx.is_sv():
+        lines = ["  always_comb begin"]
+        lines.append(f"    unique case ({sel})")
+    else:
+        lines = ["  always @(*) begin"]
+        lines.append(f"    case ({sel})")
     for i, d in enumerate(data):
         lines.append(f"      {i}: {out} = {ctx.name(d)};")
     lines.append(f"      default: {out} = {ctx.name(data[-1])};")
@@ -556,27 +573,32 @@ def _lower_register(ctx: EmitContext, g: Gate) -> list[str]:
     rst_test = f"{rst}" if polarity == "high" else f"!{rst}"
     rst_edge = f"posedge {rst}" if polarity == "high" else f"negedge {rst}"
 
+    # The enable signal name comes from the IR (either attrs.enable or
+    # inputs[1]); both are raw signal names that need the same identifier
+    # sanitization as the data input.
+    en_id = ctx.name(en_signal) if en_signal else None
     body_assign = (
-        f"{name} <= {en_signal} ? {d} : {name};"
-        if en_signal else f"{name} <= {d};"
+        f"{name} <= {en_id} ? {d} : {name};"
+        if en_id else f"{name} <= {d};"
     )
 
     vendor = _vendor_attr_lines(g)
+    always_kw = "always_ff" if ctx.is_sv() else "always"
     if rst:
         if kind == "async":
             return vendor + [
-                f"  always @(posedge {clk} or {rst_edge}) begin",
+                f"  {always_kw} @(posedge {clk} or {rst_edge}) begin",
                 f"    if ({rst_test}) {name} <= {init_lit};",
                 f"    else {body_assign}",
                 "  end",
             ]
         return vendor + [
-            f"  always @(posedge {clk}) begin",
+            f"  {always_kw} @(posedge {clk}) begin",
             f"    if ({rst_test}) {name} <= {init_lit};",
             f"    else {body_assign}",
             "  end",
         ]
-    return vendor + [f"  always @(posedge {clk}) {body_assign}"]
+    return vendor + [f"  {always_kw} @(posedge {clk}) {body_assign}"]
 
 
 @lowering("tristate")
@@ -658,6 +680,245 @@ def _lower_rom(ctx: EmitContext, g: Gate) -> list[str]:
         lines.append(f"    {rom}[{i}] = {width}'d{int(v) & mask};")
     lines.append("  end")
     lines.append(f"  assign {name} = {rom}[{addr}];")
+    return lines
+
+
+@lowering("fp8_e4m3_mul")
+def _lower_fp8_e4m3_mul(ctx: EmitContext, g: Gate) -> list[str]:
+    """Multiply two fp8 e4m3 values; produce an fp16 IEEE-754 result.
+
+    Inputs are 8-bit fp8 e4m3 bit patterns (1 sign / 4 exp / 3 mantissa).
+    Output is a 16-bit fp16 value (1 sign / 5 exp / 10 mantissa) that the
+    user can either accumulate (after a fp16 add) or feed into a final
+    softmax/argmax. fp16 keeps the multiplication's full dynamic range
+    without overflow.
+
+    The lowering inlines the e4m3 -> fp16 multiply as combinational
+    Verilog: sign XOR, exponent add (with bias adjustment), 3x3 -> 6-bit
+    mantissa multiply, normalize and round. Subnormal handling is
+    flush-to-zero on output (subnormals on input round to a small normal
+    after multiplication).
+    """
+    if len(g.inputs) != 2:
+        raise ValueError(
+            f"gate '{g.name}' kind 'fp8_e4m3_mul' expects 2 inputs"
+        )
+    a = ctx.name(g.inputs[0])
+    b = ctx.name(g.inputs[1])
+    name = ctx.name(g.name)
+    if g.output_width != 16:
+        raise ValueError(
+            f"gate '{g.name}': fp8_e4m3_mul output_width must be 16 "
+            f"(fp16); got {g.output_width}"
+        )
+    return [
+        f"  // fp8 e4m3 multiply: {name} = $signed({a}) * $signed({b})",
+        f"  wire        {name}_sign  = {a}[7] ^ {b}[7];",
+        f"  wire [3:0]  {name}_ea    = {a}[6:3];",
+        f"  wire [3:0]  {name}_eb    = {b}[6:3];",
+        f"  wire [2:0]  {name}_ma    = {a}[2:0];",
+        f"  wire [2:0]  {name}_mb    = {b}[2:0];",
+        # Implicit-leading-1 mantissas for normal inputs (4 bits each).
+        f"  wire [3:0]  {name}_ma1   = ({name}_ea == 4'd0) ? "
+        f"{{1'b0, {name}_ma}} : {{1'b1, {name}_ma}};",
+        f"  wire [3:0]  {name}_mb1   = ({name}_eb == 4'd0) ? "
+        f"{{1'b0, {name}_mb}} : {{1'b1, {name}_mb}};",
+        # 4x4 -> 8-bit mantissa product.
+        f"  wire [7:0]  {name}_mp    = {name}_ma1 * {name}_mb1;",
+        # Sum exponents (each biased by 7), subtract one bias.
+        # Result is an 8-bit signed exponent in [-14, +30].
+        f"  wire signed [7:0] {name}_es = "
+        f"$signed({{4'b0, {name}_ea}}) + $signed({{4'b0, {name}_eb}}) - 8'sd7;",
+        # Normalize: if mp[7] is set, the leading bit is at position 7
+        # (product >= 2.0); shift right 1 and bump exponent. Otherwise
+        # the leading bit is at position 6.
+        f"  wire        {name}_topbit = {name}_mp[7];",
+        f"  wire signed [7:0] {name}_e_norm = {name}_es + ({name}_topbit ? 8'sd1 : 8'sd0);",
+        # Mantissa for fp16: 10 bits. We have 6 mantissa bits below the
+        # leading 1 (positions 5..0 when topbit=0, positions 6..1 when
+        # topbit=1); pad to 10 with zeros.
+        f"  wire [9:0]  {name}_m_fp16 = {name}_topbit ? "
+        f"{{{name}_mp[6:1], 4'b0}} : {{{name}_mp[5:0], 4'b0}};",
+        # fp16 bias is 15. exponent_fp16 = e_norm + 15.
+        f"  wire signed [7:0] {name}_e_fp16_s = {name}_e_norm + 8'sd15;",
+        # Saturate / underflow handling.
+        f"  wire        {name}_zero    = ({name}_ma1 == 0) | ({name}_mb1 == 0);",
+        f"  wire        {name}_underflow = {name}_e_fp16_s <= 0;",
+        f"  wire        {name}_overflow  = {name}_e_fp16_s >= 31;",
+        f"  wire [4:0]  {name}_e_fp16 = {name}_overflow ? 5'd30 :"
+        f" ({name}_underflow ? 5'd0 : {name}_e_fp16_s[4:0]);",
+        f"  assign {name} = {name}_zero ? 16'd0 : "
+        f"{{{name}_sign, {name}_e_fp16, {name}_m_fp16}};",
+    ]
+
+
+@lowering("conv2d")
+def _lower_conv2d(ctx: EmitContext, g: Gate) -> list[str]:
+    """2-D convolution as a flat dot-product over a windowed access pattern.
+
+    inputs : [x_packed]
+    attrs:
+      in_h, in_w, in_c       input spatial dims and channel count
+      out_h, out_w, out_c    output spatial dims and channel count
+      kH, kW                 kernel height / width
+      stride_h, stride_w     vertical / horizontal stride (defaults 1)
+      pad_h, pad_w           zero-padding (defaults 0)
+      weights                list[list[list[list[int]]]] of shape
+                              [out_c][in_c][kH][kW] integer kernel weights
+      biases                 optional list[int] length out_c
+      act_bits               input element bit width
+      weight_bits            kernel weight bit width
+      out_bits               output element bit width
+
+    The lowering emits a combinational dot product per output position:
+    out[oh, ow, oc] = sum_{ic, ki, kj} W[oc, ic, ki, kj] *
+                       x[ih * stride_h - pad_h + ki,
+                         iw * stride_w - pad_w + kj, ic]
+                       + bias[oc].
+
+    This is the simplest valid Conv2D implementation: every output pixel
+    is its own combinational MAC over kH * kW * in_c products. For any
+    real-size CNN the output is a packed bus of out_h * out_w * out_c
+    elements; the lowering scales as O(out_h * out_w * out_c * kH * kW *
+    in_c) Verilog lines. Use only on small kernels; switch to a
+    sequential / im2col + matmul lowering at production scale.
+    """
+    if len(g.inputs) != 1:
+        raise ValueError(
+            f"gate '{g.name}' kind 'conv2d' expects 1 input (x_packed)"
+        )
+    a = g.attrs
+    in_h = int(a["in_h"]); in_w = int(a["in_w"]); in_c = int(a["in_c"])
+    out_h = int(a["out_h"]); out_w = int(a["out_w"]); out_c = int(a["out_c"])
+    kH = int(a["kH"]); kW = int(a["kW"])
+    stride_h = int(a.get("stride_h", 1))
+    stride_w = int(a.get("stride_w", 1))
+    pad_h = int(a.get("pad_h", 0))
+    pad_w = int(a.get("pad_w", 0))
+    act_bits = int(a["act_bits"])
+    weight_bits = int(a["weight_bits"])
+    out_bits = int(a["out_bits"])
+    weights = a["weights"]
+    biases = a.get("biases") or [0] * out_c
+
+    # Validate basic shapes
+    if len(weights) != out_c or len(weights[0]) != in_c:
+        raise ValueError(
+            f"gate '{g.name}' conv2d: weights shape mismatch "
+            f"({len(weights)},{len(weights[0])}) != ({out_c},{in_c})"
+        )
+
+    expected_out_h = (in_h + 2 * pad_h - kH) // stride_h + 1
+    expected_out_w = (in_w + 2 * pad_w - kW) // stride_w + 1
+    if expected_out_h != out_h or expected_out_w != out_w:
+        raise ValueError(
+            f"gate '{g.name}' conv2d: declared out=({out_h},{out_w}) "
+            f"doesn't match computed out=({expected_out_h},{expected_out_w})"
+        )
+
+    x = ctx.name(g.inputs[0])
+    name = ctx.name(g.name)
+    lines: list[str] = []
+    # Walk output positions in row-major (oh, ow, oc) order; assign each
+    # to its slice of the packed output bus.
+    out_elements = out_h * out_w * out_c
+    for oh in range(out_h):
+        for ow in range(out_w):
+            for oc in range(out_c):
+                terms: list[str] = []
+                for ic in range(in_c):
+                    for ki in range(kH):
+                        ih = oh * stride_h - pad_h + ki
+                        for kj in range(kW):
+                            iw = ow * stride_w - pad_w + kj
+                            wgt = int(weights[oc][ic][ki][kj])
+                            if wgt == 0:
+                                continue
+                            if 0 <= ih < in_h and 0 <= iw < in_w:
+                                # Element index in the packed input:
+                                # row-major (ih, iw, ic).
+                                in_idx = (ih * in_w + iw) * in_c + ic
+                                lo = in_idx * act_bits
+                                hi = lo + act_bits - 1
+                                xelem = f"$signed({x}[{hi}:{lo}])"
+                                if wgt == 1:
+                                    terms.append(xelem)
+                                elif wgt == -1:
+                                    terms.append(f"-{xelem}")
+                                else:
+                                    terms.append(f"({wgt} * {xelem})")
+                            # padded position: implicit 0; contributes nothing.
+                bias_val = int(biases[oc])
+                if bias_val:
+                    terms.append(str(bias_val))
+                if not terms:
+                    terms.append("0")
+                out_idx = (oh * out_w + ow) * out_c + oc
+                lo = out_idx * out_bits
+                hi = lo + out_bits - 1
+                lines.append(
+                    f"  assign {name}[{hi}:{lo}] = " + " + ".join(terms) + ";"
+                )
+    if not lines:
+        # Edge case: zero-sized output. Just tie the bus to 0.
+        total = max(1, out_elements * out_bits)
+        lines.append(f"  assign {name} = {total}'d0;")
+    return lines
+
+
+@lowering("ram_writable")
+def _lower_ram_writable(ctx: EmitContext, g: Gate) -> list[str]:
+    """Synchronous-write, asynchronous-read writable RAM.
+
+    inputs : [read_addr, write_addr, write_data, write_en]
+    attrs:
+      init       optional list[int]; baked-in initial contents (vendor
+                 synth tools usually accept this for BRAM init).
+      width      int, bit width of each entry. Must equal output_width.
+      depth      int, number of entries.
+      clk        clock signal (default "clk")
+
+    Lowering: a register array with synchronous write on the rising
+    edge of clk when ``write_en`` is asserted, asynchronous combinational
+    read at ``read_addr``. Vendor synth (Vivado / Quartus / Yosys) infers
+    this as block RAM when depth and width are large enough.
+    """
+    if len(g.inputs) != 4:
+        raise ValueError(
+            f"gate '{g.name}' kind 'ram_writable' expects 4 inputs "
+            f"(read_addr, write_addr, write_data, write_en), got "
+            f"{len(g.inputs)}"
+        )
+    read_addr = ctx.name(g.inputs[0])
+    write_addr = ctx.name(g.inputs[1])
+    write_data = ctx.name(g.inputs[2])
+    write_en = ctx.name(g.inputs[3])
+    width = int(g.attrs["width"])
+    depth = int(g.attrs["depth"])
+    clk = g.attrs.get("clk", "clk")
+    init = list(g.attrs.get("init", []))
+    if width != g.output_width:
+        raise ValueError(
+            f"gate '{g.name}' ram_writable: width={width} != "
+            f"output_width={g.output_width}"
+        )
+    name = ctx.name(g.name)
+    mem = f"{name}_mem"
+    mask = (1 << width) - 1
+    lines: list[str] = []
+    lines.append(f'  (* ram_style = "block" *)')
+    lines.append(f"  reg [{width-1}:0] {mem} [0:{depth-1}];")
+    if init:
+        lines.append("  initial begin")
+        for i in range(depth):
+            v = init[i] if i < len(init) else 0
+            lines.append(f"    {mem}[{i}] = {width}'d{int(v) & mask};")
+        lines.append("  end")
+    always_kw = "always_ff" if ctx.is_sv() else "always"
+    lines.append(f"  {always_kw} @(posedge {clk}) begin")
+    lines.append(f"    if ({write_en}) {mem}[{write_addr}] <= {write_data};")
+    lines.append(f"  end")
+    lines.append(f"  assign {name} = {mem}[{read_addr}];")
     return lines
 
 
@@ -860,16 +1121,22 @@ def emit_module(graph: GateGraph, target: str = "verilog",
             else:
                 _walk(sub)
                 inner = _emit_module_internal(
-                    sub, pack_buses=pack_buses, group_ports=group_ports
+                    sub, pack_buses=pack_buses, group_ports=group_ports,
+                    target=target,
                 )
                 if target in ("sv", "systemverilog"):
+                    # The lowerings already emit `always_ff`, `always_comb`,
+                    # and `unique case` directly in SV mode; the post-emit
+                    # rewrite now only needs to swap the wire/reg keywords
+                    # in declarations to `logic`.
                     inner = _sv_translate(inner)
                 parts.append(inner.rstrip() + "\n")
 
     _walk(graph)
 
     parent = _emit_module_internal(
-        graph, pack_buses=pack_buses, group_ports=group_ports
+        graph, pack_buses=pack_buses, group_ports=group_ports,
+        target=target,
     )
     if target in ("sv", "systemverilog"):
         parent = _sv_translate(parent)
@@ -893,7 +1160,8 @@ def _sv_translate(verilog_text: str) -> str:
 
 
 def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
-                          group_ports: bool = False) -> str:
+                          group_ports: bool = False,
+                          target: str = "verilog") -> str:
     _validate_module_name(graph.top)
 
     used: set[str] = set()
@@ -927,13 +1195,21 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
         if g.name not in sigmap:
             sigmap[g.name] = _sanitize(g.name, used)
 
+    def _gate_total_bits(g: Gate) -> int:
+        if not getattr(g, "output_shape", ()):
+            return max(1, g.output_width)
+        n = 1
+        for d in g.output_shape:
+            n *= int(d)
+        return max(1, g.output_width) * n
+
     widths: dict[str, int] = {}
     signed: dict[str, bool] = {}
     for s in list(graph.inputs) + list(graph.outputs):
-        widths[s.name] = max(1, s.width)
+        widths[s.name] = s.total_bits()
         signed[s.name] = s.signed
     for g in graph.gates:
-        widths[g.name] = max(1, g.output_width)
+        widths[g.name] = _gate_total_bits(g)
         signed[g.name] = g.output_signed
 
     # Register outputs are pre-declared: a `register` gate's D input is a
@@ -988,7 +1264,7 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
         g.kind == "register" and g.attrs.get("rst") for g in graph.gates
     )
 
-    ctx = EmitContext(sigmap, widths, signed)
+    ctx = EmitContext(sigmap, widths, signed, target=target)
 
     lines: list[str] = []
     lines.append("// Generated by safetensors2verilog.")
@@ -1042,10 +1318,10 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
             continue
         if s.direction == "inout":
             decl = _signal_decl("inout", "wire", sigmap[s.name],
-                                max(1, s.width), s.signed)
+                                s.total_bits(), s.signed)
         else:
             decl = _signal_decl("input", "wire", sigmap[s.name],
-                                max(1, s.width), s.signed)
+                                s.total_bits(), s.signed)
         port_decls.append(decl)
         port_decl_pairs.append((s.name, decl))
     # Track gates whose lowering needs `reg` declarations
@@ -1053,11 +1329,11 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
     for s in graph.outputs:
         if s.direction == "inout":
             decl = _signal_decl("inout", "wire", sigmap[s.name],
-                                max(1, s.width), s.signed)
+                                s.total_bits(), s.signed)
         else:
             kw = "reg" if s.name in reg_gates else "wire"
             decl = _signal_decl("output", kw, sigmap[s.name],
-                                max(1, s.width), s.signed)
+                                s.total_bits(), s.signed)
         port_decls.append(decl)
         port_decl_pairs.append((s.name, decl))
 
@@ -1101,7 +1377,7 @@ def _emit_module_internal(graph: GateGraph, pack_buses: bool = False,
             kw = "reg" if g.name in reg_gates else "wire"
             lines.append(
                 _signal_decl(None, kw, sigmap[g.name],
-                             max(1, g.output_width), g.output_signed) + ";"
+                             _gate_total_bits(g), g.output_signed) + ";"
             )
         lines.append("")
 
@@ -1218,6 +1494,76 @@ def emit_top_wrapper(
 
 
 # ---- BRAM template (for memory carve-out) -----------------------------------
+
+
+def emit_instantiation_template(
+    graph: GateGraph, *,
+    instance_name: str = "u_inst",
+    indent: str = "  ",
+    include_param_overrides: bool = True,
+) -> str:
+    """Emit a Verilog instantiation snippet for ``graph.top``.
+
+    Frontends often produce a generated module that the user wants to
+    instantiate one or more times in a hand-written wrapper (e.g. a
+    matmul-block parameterised by (M, K) instantiated N times for the
+    different layers of a larger pipeline). This helper renders an
+    `instance` template with every external port bound to a
+    same-name parent signal, leaving placeholder comments for the user
+    to wire up their own connections.
+
+    instance_name:           the instance identifier in the generated text.
+    indent:                  indentation prefix (defaults to two spaces).
+    include_param_overrides: when the graph has Verilog parameter ports
+        (Signal.is_parameter), emit a ``#(.NAME(value), ...)`` block with
+        the default values. Set to False for a bare instantiation.
+
+    Returns a single string the user can paste into their wrapper module.
+    """
+    _validate_module_name(graph.top)
+    parts: list[str] = [
+        f"// Instantiation template for {graph.top}",
+        f"// Generated by safetensors2verilog.emit_instantiation_template",
+    ]
+
+    parameter_signals = [s for s in graph.inputs if s.is_parameter]
+    if include_param_overrides and parameter_signals:
+        parts.append(f"{graph.top} #(")
+        param_lines = []
+        for s in parameter_signals:
+            sign_letter = "s" if s.signed else ""
+            width = max(1, s.width)
+            mask = (1 << width) - 1
+            param_lines.append(
+                f"{indent}.{s.name}({width}'{sign_letter}d"
+                f"{s.parameter_value & mask})"
+            )
+        parts.append(",\n".join(param_lines))
+        parts.append(f") {instance_name} (")
+    else:
+        parts.append(f"{graph.top} {instance_name} (")
+
+    port_lines: list[str] = []
+    has_register = any(g.kind == "register" for g in graph.gates)
+    has_reset = any(
+        g.kind == "register" and g.attrs.get("rst") for g in graph.gates
+    )
+    explicit_input_names = {s.name for s in graph.inputs}
+    if has_register and "clk" not in explicit_input_names:
+        port_lines.append(f"{indent}.clk(clk)")
+    if has_reset and "rst" not in explicit_input_names:
+        port_lines.append(f"{indent}.rst(rst)")
+    for s in graph.inputs:
+        if s.is_parameter:
+            continue
+        # Same-name binding by default; users replace the rhs with their
+        # parent-side wire.
+        port_lines.append(f"{indent}.{s.name}({s.name})")
+    for s in graph.outputs:
+        port_lines.append(f"{indent}.{s.name}({s.name})")
+    parts.append(",\n".join(port_lines))
+    parts.append(");")
+    return "\n".join(parts) + "\n"
 
 
 def emit_bram_template(

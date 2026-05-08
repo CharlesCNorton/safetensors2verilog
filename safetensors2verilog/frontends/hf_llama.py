@@ -232,11 +232,17 @@ def build_llama_graph(
     weight_bits: int = DEFAULT_WEIGHT_BITS,
     skip_lm_head: bool = False,
     streaming_lm_head_threshold: int = 1024,
+    requantize_params: list[dict[str, dict[str, list[int]]]] | None = None,
 ) -> GateGraph:
     """Build the per-token forward-pass GateGraph for a LLaMA-architecture model.
 
     config: parsed config.json.
     state_dict: tensor name -> torch tensor (any float dtype).
+    requantize_params: optional per-layer per-site (muls, shifts) lists
+        produced by ``safetensors2verilog.calibration.derive_requantize_params``.
+        When supplied, each requantize site uses the per-channel calibrated
+        ``muls`` / ``shifts`` instead of the heuristic uniform shift. Pass
+        ``None`` (default) to keep the original behaviour.
     """
     HID = int(config["hidden_size"])
     N_LAYERS = int(config["num_hidden_layers"])
@@ -312,6 +318,36 @@ def build_llama_graph(
     )
     submodules.append(rope_sub)
 
+    if requantize_params is not None and len(requantize_params) < N_LAYERS:
+        raise ValueError(
+            f"requantize_params has {len(requantize_params)} layer entries "
+            f"but the model has {N_LAYERS} layers"
+        )
+
+    def _pick_rq(li: int, site: str, K: int, default_shift: int
+                 ) -> tuple[list[int], list[int]]:
+        """Pick (muls, shifts) for layer ``li`` requantize site ``site``.
+
+        Returns the calibrated per-channel lists when ``requantize_params``
+        was supplied; otherwise the heuristic (muls all 1, shifts all
+        ``default_shift``). Validates lengths so a mis-shaped calibration
+        gets caught at compile time, not at synthesis.
+        """
+        if requantize_params is None:
+            return [1] * K, [default_shift] * K
+        site_p = requantize_params[li].get(site)
+        if site_p is None:
+            return [1] * K, [default_shift] * K
+        muls = list(site_p["muls"])
+        shifts = list(site_p["shifts"])
+        if len(muls) != K or len(shifts) != K:
+            raise ValueError(
+                f"calibration site '{site}' on layer {li} has "
+                f"len(muls)={len(muls)}, len(shifts)={len(shifts)}, "
+                f"expected K={K}"
+            )
+        return muls, shifts
+
     for li in range(N_LAYERS):
         prefix = f"L{li}"
 
@@ -378,9 +414,10 @@ def build_llama_graph(
             ))
 
         for tag, K_w in (("q", HID), ("k", KV * D), ("v", KV * D)):
+            rq_muls, rq_shifts = _pick_rq(li, tag, K_w, qkv_shift)
             rq = requantize_block(
                 K=K_w, in_bits=qkv_obits, out_bits=abits,
-                muls=[1] * K_w, shifts=[qkv_shift] * K_w, mul_bits=8,
+                muls=rq_muls, shifts=rq_shifts, mul_bits=8,
                 module_suffix=f"{prefix}_{tag}",
             )
             submodules.append(rq)
@@ -456,9 +493,10 @@ def build_llama_graph(
             extra_outputs=[("done", f"{prefix}.o.done")],
             output_width=HID * o_obits, output_signed=True,
         ))
+        rq_o_muls, rq_o_shifts = _pick_rq(li, "o", HID, o_shift)
         rq_o = requantize_block(
             K=HID, in_bits=o_obits, out_bits=abits,
-            muls=[1] * HID, shifts=[o_shift] * HID, mul_bits=8,
+            muls=rq_o_muls, shifts=rq_o_shifts, mul_bits=8,
             module_suffix=f"{prefix}_o",
         )
         submodules.append(rq_o)
@@ -539,9 +577,10 @@ def build_llama_graph(
             ))
 
         for tag, K_w in (("gate", INTER), ("up", INTER)):
+            rq_muls, rq_shifts = _pick_rq(li, tag, K_w, gate_shift)
             rq = requantize_block(
                 K=K_w, in_bits=mlp_obits, out_bits=abits,
-                muls=[1] * K_w, shifts=[gate_shift] * K_w, mul_bits=8,
+                muls=rq_muls, shifts=rq_shifts, mul_bits=8,
                 module_suffix=f"{prefix}_{tag}",
             )
             submodules.append(rq)
@@ -590,9 +629,10 @@ def build_llama_graph(
             extra_outputs=[("done", f"{prefix}.down.done")],
             output_width=HID * down_obits, output_signed=True,
         ))
+        rq_d_muls, rq_d_shifts = _pick_rq(li, "down", HID, down_shift)
         rq_d = requantize_block(
             K=HID, in_bits=down_obits, out_bits=abits,
-            muls=[1] * HID, shifts=[down_shift] * HID, mul_bits=8,
+            muls=rq_d_muls, shifts=rq_d_shifts, mul_bits=8,
             module_suffix=f"{prefix}_down",
         )
         submodules.append(rq_d)
@@ -841,6 +881,18 @@ class HFLlamaFrontend(Frontend):
                      "where the 49152-output lm_head dominates iverilog "
                      "parse time; the lm_head + argmax can be done on CPU.",
             ),
+            FrontendOption(
+                name="calibration",
+                type=str,
+                default=None,
+                help="path to a JSON file produced by "
+                     "safetensors2verilog.calibration.derive_requantize_params "
+                     "(serialised list[dict[str, dict[str, list[int]]]]). "
+                     "When supplied, every requantize site uses the "
+                     "calibrated per-channel (muls, shifts) instead of "
+                     "the heuristic uniform shift.",
+                metavar="PATH",
+            ),
         ]
 
     def parse(
@@ -853,6 +905,7 @@ class HFLlamaFrontend(Frontend):
         max_seq_override: int = 0,
         num_layers_override: int = 0,
         skip_lm_head: bool = False,
+        calibration: str | None = None,
         **options,
     ) -> GateGraph:
         path = Path(path)
@@ -877,8 +930,23 @@ class HFLlamaFrontend(Frontend):
             for k in f.keys():
                 state_dict[k] = f.get_tensor(k).clone()
 
+        rq_params = None
+        if calibration is not None:
+            cal_path = Path(calibration)
+            if not cal_path.exists():
+                raise FileNotFoundError(
+                    f"calibration JSON not found at {cal_path}"
+                )
+            rq_params = json.loads(cal_path.read_text(encoding="utf-8"))
+            if not isinstance(rq_params, list):
+                raise ValueError(
+                    f"{cal_path}: expected a JSON list[dict] of per-layer "
+                    f"requantize params, got {type(rq_params).__name__}"
+                )
+
         return build_llama_graph(
             config=cfg, state_dict=state_dict, top=top,
             abits=activation_bits, weight_bits=weight_bits,
             skip_lm_head=skip_lm_head,
+            requantize_params=rq_params,
         )

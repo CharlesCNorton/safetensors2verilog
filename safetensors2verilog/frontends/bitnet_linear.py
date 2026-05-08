@@ -102,6 +102,11 @@ def _build_sequential(
     activation_bits: int,
     clamp_range: tuple[int, int] | None,
     top: str,
+    *,
+    parallelism: int = 0,
+    streaming_input: bool = False,
+    handshake: bool = False,
+    weight_bram: bool = False,
 ) -> GateGraph:
     """Build a streaming-MAC architecture for chained ternary linear layers.
 
@@ -154,9 +159,12 @@ def _build_sequential(
         cur_w = cur_w + grow
         mac_widths.append(cur_w)
 
-    state_w = 2
+    # state_w = 3 when streaming_input adds the FILLING state, else 2.
+    state_w = 3 if streaming_input else 2
     layer_w = max(1, K.bit_length())
     counter_w = max(1, max(in_sizes).bit_length())
+    # When streaming_input is on, fill_counter walks 0..in_sizes[0]-1.
+    fill_counter_w = max(1, in_sizes[0].bit_length()) if streaming_input else 1
 
     gates: list[Gate] = []
 
@@ -171,9 +179,21 @@ def _build_sequential(
         ))
 
     # ---- Constants ----
+    # State encoding:
+    #   IDLE=0, COMPUTE=1, DONE=2 always present
+    #   FILL=3 only when streaming_input is on (state_w=3 in that case)
     add("const.state.idle",    "constant", attrs={"value": 0}, output_width=state_w)
     add("const.state.compute", "constant", attrs={"value": 1}, output_width=state_w)
     add("const.state.done",    "constant", attrs={"value": 2}, output_width=state_w)
+    if streaming_input:
+        add("const.state.fill", "constant", attrs={"value": 3}, output_width=state_w)
+        add("const.fill.zero",  "constant", attrs={"value": 0},
+            output_width=fill_counter_w)
+        add("const.fill.one",   "constant", attrs={"value": 1},
+            output_width=fill_counter_w)
+        add("const.fill.max",   "constant",
+            attrs={"value": in_sizes[0] - 1},
+            output_width=fill_counter_w)
     add("const.counter.zero",  "constant", attrs={"value": 0}, output_width=counter_w)
     add("const.counter.one",   "constant", attrs={"value": 1}, output_width=counter_w)
     add("const.layer.zero",    "constant", attrs={"value": 0}, output_width=layer_w)
@@ -190,6 +210,17 @@ def _build_sequential(
     add("is_idle",    "eq", inputs=["state.curr", "const.state.idle"])
     add("is_compute", "eq", inputs=["state.curr", "const.state.compute"])
     add("is_done",    "eq", inputs=["state.curr", "const.state.done"])
+    if streaming_input:
+        add("is_fill", "eq", inputs=["state.curr", "const.state.fill"])
+        # fill_at_max: fill_counter == in_sizes[0]-1 and valid_in is high.
+        add("fill_at_max",
+            "eq", inputs=["fill_counter.curr", "const.fill.max"])
+        add("fill_at_max_and_valid", "and",
+            inputs=["fill_at_max", "valid_in"])
+        add("fill_progress", "and", inputs=["is_fill", "valid_in"])
+        # idle_and_start now means "begin filling"
+        add("filling_done", "and",
+            inputs=["is_fill", "fill_at_max_and_valid"])
 
     # is_layer.<L>: layer_idx == L
     for L in range(K):
@@ -214,12 +245,14 @@ def _build_sequential(
 
     add("is_last_layer", "eq", inputs=["layer_idx.curr", "const.layer.last"])
     # transition_layer = is_compute && is_last_input && !is_last_layer
+    # finishing       = is_compute && is_last_input && is_last_layer
+    # With parallelism, both also require output_group_at_max so that all
+    # groups in the current layer have completed.
     add("not_last_layer", "not", inputs=["is_last_layer"])
     add("compute_and_last_input", "and",
         inputs=["is_compute", "is_last_input"])
     add("transition_layer", "and",
         inputs=["compute_and_last_input", "not_last_layer"])
-    # finishing = is_compute && is_last_input && is_last_layer
     add("finishing", "and",
         inputs=["compute_and_last_input", "is_last_layer"])
     # idle_and_start = is_idle && start
@@ -227,36 +260,104 @@ def _build_sequential(
     # not_idle_and_start = !idle_and_start
     add("not_idle_and_start", "not", inputs=["idle_and_start"])
 
+    # ---- parallelism: precompute output_group_at_max and effective FSM
+    # gating so the state.next / layer_idx.next stages below can reference
+    # the gated signals.
+    use_parallelism = parallelism > 0 and parallelism < max(out_sizes)
+    if use_parallelism:
+        max_groups = max((sz + parallelism - 1) // parallelism
+                         for sz in out_sizes)
+        group_w = max(1, (max_groups - 1).bit_length())
+        add("const.group.zero", "constant",
+            attrs={"value": 0}, output_width=group_w)
+        add("const.group.one", "constant",
+            attrs={"value": 1}, output_width=group_w)
+        for L in range(K):
+            ngroups = (out_sizes[L] + parallelism - 1) // parallelism
+            add(f"const.group_max.{L}", "constant",
+                attrs={"value": ngroups - 1}, output_width=group_w)
+            add(f"output_group_at_max.{L}", "eq",
+                inputs=["output_group.curr", f"const.group_max.{L}"])
+        if K == 1:
+            add("output_group_at_max", "or",
+                inputs=["output_group_at_max.0"])
+        else:
+            add("output_group_at_max", "mux",
+                inputs=["layer_idx.curr"]
+                       + [f"output_group_at_max.{L}" for L in range(K)],
+                output_width=1)
+        # Effective FSM signals: layer-transition only happens when both
+        # counter and output_group complete; finishing only when last
+        # layer's last group's last input completes.
+        add("eff_transition_layer", "and",
+            inputs=["transition_layer", "output_group_at_max"])
+        add("eff_finishing", "and",
+            inputs=["finishing", "output_group_at_max"])
+    else:
+        # Aliases so downstream code can always reference eff_* names.
+        add("eff_transition_layer", "or", inputs=["transition_layer"])
+        add("eff_finishing", "or", inputs=["finishing"])
+
     # ---- next_state -----------------------------------------------------
-    # IDLE  : on start -> COMPUTE; else stay IDLE
-    # COMPUTE : if finishing -> DONE; else stay COMPUTE
-    # DONE  : -> IDLE
+    # Base FSM (no variants):
+    #   IDLE -> on start -> COMPUTE
+    #   COMPUTE -> on finishing -> DONE; else stay
+    #   DONE -> IDLE
     #
-    # Encoded as: state_next = mux on the priority list:
-    #   if is_done       -> IDLE
-    #   elif finishing   -> DONE
-    #   elif idle_and_start -> COMPUTE
-    #   elif is_compute and not finishing -> COMPUTE (stay)
-    #   elif is_idle and not start -> IDLE
-    #   else (unreachable) -> IDLE
-    # We build it via chained 2-input muxes.
-    #
-    # Stage A: from_compute_target = is_compute && finishing ? DONE : COMPUTE
-    add("from_compute_target", "mux",
-        inputs=["finishing", "const.state.compute", "const.state.done"],
-        output_width=state_w)
-    # Stage B: from_idle_target = is_idle && start ? COMPUTE : IDLE
-    add("from_idle_target", "mux",
-        inputs=["idle_and_start", "const.state.idle", "const.state.compute"],
-        output_width=state_w)
-    # Stage C: combine with is_compute selector
-    add("state_next_intermediate", "mux",
-        inputs=["is_compute", "from_idle_target", "from_compute_target"],
-        output_width=state_w)
-    # Stage D: if is_done, override to IDLE
-    add("state.next", "mux",
-        inputs=["is_done", "state_next_intermediate", "const.state.idle"],
-        output_width=state_w)
+    # With streaming_input: IDLE -> on start -> FILL; FILL -> on filling_done
+    #   -> COMPUTE.
+    # With handshake: DONE -> IDLE only when ready_in; else hold in DONE.
+    if streaming_input:
+        # IDLE: on start -> FILL; else stay
+        add("from_idle_target", "mux",
+            inputs=["idle_and_start",
+                    "const.state.idle", "const.state.fill"],
+            output_width=state_w)
+        # FILL: on filling_done -> COMPUTE; else stay
+        add("from_fill_target", "mux",
+            inputs=["filling_done",
+                    "const.state.fill", "const.state.compute"],
+            output_width=state_w)
+        # COMPUTE: on eff_finishing -> DONE; else stay
+        add("from_compute_target", "mux",
+            inputs=["eff_finishing", "const.state.compute", "const.state.done"],
+            output_width=state_w)
+        # priority: is_done > is_compute > is_fill > else (idle)
+        add("state_next_no_done", "mux",
+            inputs=["state.curr", "from_idle_target",
+                    "from_compute_target", "from_fill_target",
+                    "from_idle_target"],
+            output_width=state_w)
+    else:
+        add("from_compute_target", "mux",
+            inputs=["eff_finishing", "const.state.compute", "const.state.done"],
+            output_width=state_w)
+        add("from_idle_target", "mux",
+            inputs=["idle_and_start",
+                    "const.state.idle", "const.state.compute"],
+            output_width=state_w)
+        add("state_next_no_done", "mux",
+            inputs=["is_compute", "from_idle_target", "from_compute_target"],
+            output_width=state_w)
+
+    # Handshake gating on the DONE -> IDLE transition.
+    if handshake:
+        # done_release = is_done && ready_in
+        add("done_release", "and", inputs=["is_done", "ready_in"])
+        # If is_done && !ready_in, hold in DONE; if is_done && ready_in,
+        # transition to IDLE.
+        add("from_done_target", "mux",
+            inputs=["done_release",
+                    "const.state.done", "const.state.idle"],
+            output_width=state_w)
+        add("state.next", "mux",
+            inputs=["is_done", "state_next_no_done", "from_done_target"],
+            output_width=state_w)
+    else:
+        # Default: DONE -> IDLE unconditionally.
+        add("state.next", "mux",
+            inputs=["is_done", "state_next_no_done", "const.state.idle"],
+            output_width=state_w)
     add("state.curr", "register",
         inputs=["state.next"],
         attrs={"clk": "clk", "rst": "rst", "init": 0},
@@ -290,7 +391,7 @@ def _build_sequential(
         inputs=["layer_idx.curr", "const.layer.one"],
         output_width=layer_w)
     add("layer_idx_after_transition", "mux",
-        inputs=["transition_layer", "layer_idx.curr", "layer_idx_plus_one"],
+        inputs=["eff_transition_layer", "layer_idx.curr", "layer_idx_plus_one"],
         output_width=layer_w)
     add("layer_idx.next", "mux",
         inputs=["idle_and_start", "layer_idx_after_transition", "const.layer.zero"],
@@ -300,13 +401,98 @@ def _build_sequential(
         attrs={"clk": "clk", "rst": "rst", "init": 0},
         output_width=layer_w)
 
+    # ---- parallelism: output_group register + per-MAC group gating -----
+    # When parallelism > 0 and < max(out_sizes), the FSM walks through
+    # ceil(out_size / parallelism) output groups within each layer; only
+    # accumulators whose j // parallelism == output_group update each
+    # cycle. The IR still emits every accumulator (no physical MAC
+    # sharing in this lowering); the synth tool may infer sharing under
+    # resource-sharing passes.
+    if use_parallelism:
+        # output_group walks 0..ngroups[L]-1 within each layer; resets on
+        # idle_and_start and on layer transitions.
+        add("output_group_plus_one", "add",
+            inputs=["output_group.curr", "const.group.one"],
+            output_width=group_w)
+        add("counter_wrapping", "and",
+            inputs=["is_compute", "is_last_input"])
+        add("group_step", "and",
+            inputs=["counter_wrapping", "is_compute"])
+        add("output_group_after_step", "mux",
+            inputs=["group_step",
+                    "output_group.curr", "output_group_plus_one"],
+            output_width=group_w)
+        add("output_group_wrap", "and",
+            inputs=["counter_wrapping", "output_group_at_max"])
+        add("output_group_advance", "mux",
+            inputs=["output_group_wrap",
+                    "output_group_after_step", "const.group.zero"],
+            output_width=group_w)
+        add("output_group.next", "mux",
+            inputs=["idle_and_start",
+                    "output_group_advance", "const.group.zero"],
+            output_width=group_w)
+        add("output_group.curr", "register",
+            inputs=["output_group.next"],
+            attrs={"clk": "clk", "rst": "rst", "init": 0},
+            output_width=group_w)
+        # Per-(L, j) group-match constants: 1 iff j // parallelism ==
+        # output_group.curr (for the current layer).
+        for L in range(K):
+            for j in range(out_sizes[L]):
+                grp = j // parallelism
+                add(f"const.group.{L}.{j}", "constant",
+                    attrs={"value": grp}, output_width=group_w)
+                add(f"group_match_L{L}_j{j}", "eq",
+                    inputs=["output_group.curr", f"const.group.{L}.{j}"])
+
+    # ---- Streaming-input: fill counter + in_buf register file -----------
+    if streaming_input:
+        # fill_counter increments while in_fill && valid_in.
+        add("fill_counter_plus_one", "add",
+            inputs=["fill_counter.curr", "const.fill.one"],
+            output_width=fill_counter_w)
+        add("fill_counter_after_step", "mux",
+            inputs=["fill_progress",
+                    "fill_counter.curr", "fill_counter_plus_one"],
+            output_width=fill_counter_w)
+        # On idle_and_start, reset fill_counter to 0.
+        add("fill_counter.next", "mux",
+            inputs=["idle_and_start",
+                    "fill_counter_after_step", "const.fill.zero"],
+            output_width=fill_counter_w)
+        add("fill_counter.curr", "register",
+            inputs=["fill_counter.next"],
+            attrs={"clk": "clk", "rst": "rst", "init": 0},
+            output_width=fill_counter_w)
+        # in_buf[i]: write-enable when fill_progress && fill_counter.curr == i
+        for i in range(in_sizes[0]):
+            add(f"in_buf.idx_{i}", "constant",
+                attrs={"value": i}, output_width=fill_counter_w)
+            add(f"in_buf.match_{i}", "eq",
+                inputs=["fill_counter.curr", f"in_buf.idx_{i}"])
+            add(f"in_buf.we_{i}", "and",
+                inputs=["fill_progress", f"in_buf.match_{i}"])
+            # Register's enable input: writes x when we_{i} is high.
+            add(f"in_buf.{i}.curr", "register",
+                inputs=["x", f"in_buf.we_{i}"],
+                attrs={"clk": "clk", "rst": "rst", "init": 0,
+                       "enable": f"in_buf.we_{i}"},
+                output_width=activation_bits, output_signed=True)
+        # ready_out: high while in FILL state. Caller asserts valid_in to
+        # clock data into in_buf at fill_counter; one element per cycle.
+        add("ready_out", "or", inputs=["is_fill"])
+
     # ---- Per-layer input mux: input_for_layer[L][counter] ---------------
-    # Layer 0 reads from external x[0..N0-1].
+    # Layer 0 reads from external x[0..N0-1] (or in_buf when streaming_input).
     # Layer L>0 reads from previous layer's accumulators.
     # Each layer's input mux picks 1 input based on counter.
     for L in range(K):
         if L == 0:
-            sources = [f"x{i}" for i in range(in_sizes[0])]
+            if streaming_input:
+                sources = [f"in_buf.{i}.curr" for i in range(in_sizes[0])]
+            else:
+                sources = [f"x{i}" for i in range(in_sizes[0])]
         else:
             sources = [f"L{L-1}.acc{j}.curr" for j in range(out_sizes[L-1])]
         # Pad sources to power-of-2 size for clean mux indexing? Not needed:
@@ -326,6 +512,35 @@ def _build_sequential(
             add(f"L{L}.input_mux", "mux",
                 inputs=["counter.curr"] + sources,
                 output_width=sw, output_signed=True)
+
+    # ---- weight_bram: per-ROM write-enable routing ----------------------
+    if weight_bram:
+        # weight_addr_layer selects which layer's ROMs accept writes;
+        # weight_addr_output selects which output (j) within that layer;
+        # weight_addr_position is the in-row position the ROM sees as its
+        # write_addr (also driven by counter.curr for reads, but the RAM
+        # primitive distinguishes read_addr from write_addr).
+        for L in range(K):
+            add(f"const.weight_layer.{L}", "constant",
+                attrs={"value": L}, output_width=layer_w)
+            add(f"weight_layer_match.{L}", "eq",
+                inputs=["weight_addr_layer", f"const.weight_layer.{L}"])
+            for j in range(out_sizes[L]):
+                # output_idx_w widens to fit the largest layer; padding for
+                # narrower layers is harmless because the equality check
+                # against the layer-specific output index does the right
+                # thing on zero-padded values.
+                add(f"const.weight_output.{L}.{j}", "constant",
+                    attrs={"value": j},
+                    output_width=max(1, max(out_sizes).bit_length()))
+                add(f"weight_output_match_L{L}_j{j}", "eq",
+                    inputs=["weight_addr_output",
+                            f"const.weight_output.{L}.{j}"])
+                add(f"weight_lj_match_L{L}_j{j}", "and",
+                    inputs=[f"weight_layer_match.{L}",
+                            f"weight_output_match_L{L}_j{j}"])
+                add(f"weight_we_L{L}_j{j}", "and",
+                    inputs=["weight_we", f"weight_lj_match_L{L}_j{j}"])
 
     # ---- Per-(L, j): weight ROM, product, accumulator -------------------
     for L in range(K):
@@ -353,10 +568,25 @@ def _build_sequential(
                     raise ValueError(
                         f"ternary check failed: weight {w} for L{L}.j{j}"
                     )
-            add(f"L{L}.rom{j}", "rom",
-                inputs=["counter.curr"],
-                attrs={"init": rom_init, "width": 2, "depth": in_sizes[L]},
-                output_width=2, output_signed=True)
+            if weight_bram:
+                # Writable RAM: caller drives weight_addr_layer /
+                # weight_addr_output / weight_addr_position / weight_data /
+                # weight_we. The per-(L,j) gates above mask weight_we so
+                # each ROM only accepts the writes intended for it.
+                add(f"L{L}.rom{j}", "ram_writable",
+                    inputs=["counter.curr",          # read_addr
+                            "weight_addr_position",  # write_addr
+                            "weight_data",           # write_data
+                            f"weight_we_L{L}_j{j}"], # write_en (per-ROM)
+                    attrs={"init": rom_init, "width": 2,
+                           "depth": in_sizes[L], "clk": "clk"},
+                    output_width=2, output_signed=True)
+            else:
+                add(f"L{L}.rom{j}", "rom",
+                    inputs=["counter.curr"],
+                    attrs={"init": rom_init, "width": 2,
+                           "depth": in_sizes[L]},
+                    output_width=2, output_signed=True)
 
             # product = weight * input  (signed mul; width = sum of operand widths)
             add(f"L{L}.prod{j}", "mul",
@@ -368,8 +598,16 @@ def _build_sequential(
             # add_value = acc.curr + product
             # update_or_hold = is_active_for_L ? add_value : acc.curr
             # acc.next = idle_and_start ? 0 : update_or_hold
-            add(f"L{L}.is_active{j}", "and",
-                inputs=["is_compute", f"is_layer.{L}"])
+            if use_parallelism:
+                # is_active for (L, j) requires the group match too.
+                add(f"L{L}.is_active_pre{j}", "and",
+                    inputs=["is_compute", f"is_layer.{L}"])
+                add(f"L{L}.is_active{j}", "and",
+                    inputs=[f"L{L}.is_active_pre{j}",
+                            f"group_match_L{L}_j{j}"])
+            else:
+                add(f"L{L}.is_active{j}", "and",
+                    inputs=["is_compute", f"is_layer.{L}"])
             add(f"L{L}.sum{j}", "add",
                 inputs=[f"L{L}.acc{j}.curr", f"L{L}.prod{j}"],
                 output_width=mac_widths[L], output_signed=True)
@@ -432,12 +670,38 @@ def _build_sequential(
     # done = is_done; alias via an `or` so it has a public name.
     add("done", "or", inputs=["is_done"])
 
+    # ---- handshake: valid_out = is_done; ready_in is a module input ----
+    if handshake:
+        add("valid_out", "or", inputs=["is_done"])
+
     # ---- External signals ----------------------------------------------
     inputs = [Signal("start", width=1), Signal("rst", width=1)]
-    for i in range(in_sizes[0]):
-        inputs.append(Signal(f"x{i}", width=activation_bits, signed=True))
+    if streaming_input:
+        inputs.append(Signal("x", width=activation_bits, signed=True))
+        inputs.append(Signal("valid_in", width=1))
+    else:
+        for i in range(in_sizes[0]):
+            inputs.append(
+                Signal(f"x{i}", width=activation_bits, signed=True)
+            )
+    if handshake:
+        inputs.append(Signal("ready_in", width=1))
+    if weight_bram:
+        # Address ports widths: layer needs ceil(log2(K)), output needs
+        # ceil(log2(max(out_sizes))), position needs ceil(log2(max(in_sizes))).
+        out_idx_w = max(1, max(out_sizes).bit_length())
+        pos_w = counter_w
+        inputs.append(Signal("weight_addr_layer", width=layer_w))
+        inputs.append(Signal("weight_addr_output", width=out_idx_w))
+        inputs.append(Signal("weight_addr_position", width=pos_w))
+        inputs.append(Signal("weight_data", width=2, signed=True))
+        inputs.append(Signal("weight_we", width=1))
 
     outputs = [Signal("done", width=1)]
+    if streaming_input:
+        outputs.append(Signal("ready_out", width=1))
+    if handshake:
+        outputs.append(Signal("valid_out", width=1))
     for j in range(out_sizes[final_L]):
         outputs.append(Signal(f"y{j}", width=final_mac_width, signed=True))
 
@@ -570,34 +834,16 @@ class BitNetLinearFrontend(Frontend):
                 "(one input per cycle into shared MAC hardware)."
             )
 
-        # Sequential-bitnet variants are surfaced in --help so users can
-        # see them, but refuse a non-default value with a clear pointer
-        # to the design rather than silently ignoring it. The
-        # architectural changes for each variant are documented in
-        # docs/DEFERRED.md.
-        if parallelism not in (0,):
-            raise NotImplementedError(
-                "--parallelism N is exposed but the FSM rewiring for "
-                "time-multiplexed output groups isn't landed yet. See "
-                "docs/DEFERRED.md ('--parallelism N: time-multiplex "
-                "outputs')."
+        # Sequential-bitnet variants are now wired through.
+        if parallelism < 0:
+            raise ValueError(
+                f"--parallelism must be non-negative, got {parallelism}"
             )
-        if streaming_input:
-            raise NotImplementedError(
-                "--streaming-input needs an in_buf register file plus "
-                "valid_in/ready_out plus an FSM IDLE_FILL state. See "
-                "docs/DEFERRED.md ('--streaming-input')."
-            )
-        if handshake:
-            raise NotImplementedError(
-                "--handshake needs a 4-state FSM with VALID_WAITING. "
-                "See docs/DEFERRED.md ('--handshake')."
-            )
-        if weight_bram:
-            raise NotImplementedError(
-                "--weight-bram needs a writable bram IR kind (or rom "
-                "with write attrs) plus weight_addr/data/we ports. "
-                "See docs/DEFERRED.md ('--weight-bram')."
+        if (parallelism or streaming_input or handshake or weight_bram) \
+                and not sequential:
+            raise ValueError(
+                "--parallelism / --streaming-input / --handshake / "
+                "--weight-bram only apply with --sequential."
             )
 
         clamp_range = _parse_clamp_arg(output_clamp)
@@ -649,7 +895,11 @@ class BitNetLinearFrontend(Frontend):
 
         if sequential:
             return _build_sequential(
-                layers_data, activation_bits, clamp_range, top
+                layers_data, activation_bits, clamp_range, top,
+                parallelism=parallelism,
+                streaming_input=streaming_input,
+                handshake=handshake,
+                weight_bram=weight_bram,
             )
 
         gates: list[Gate] = []

@@ -46,6 +46,7 @@ Float-format coercion:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -170,6 +171,104 @@ def per_channel_symmetric_int(
         fp_max_abs=fp_max_abs,
         rmse=rmse,
     )
+
+
+# --------------------------------------------------------------------------
+# fp8 e4m3 native quantisation
+# --------------------------------------------------------------------------
+
+
+def _fp32_to_fp8_e4m3_bits(x: float) -> int:
+    """Convert one fp32 value to its 8-bit fp8 e4m3 bit pattern.
+
+    Format: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits.
+    Special-cases:
+      x = 0     -> 0x00
+      x = +inf  -> 0x7e (one less than NaN, e4m3 doesn't have +/-inf)
+      x = NaN   -> 0x7f
+      saturating: values above the max representable (~448) clamp to max.
+
+    Matches the OCP MX standard for FP8 E4M3 (no infinities; NaN is
+    encoded as 0x7f / 0xff).
+    """
+    if x != x:  # NaN
+        return 0x7f
+    if x == 0.0:
+        return 0x00
+    sign = 0x80 if x < 0 else 0
+    a = abs(x)
+    # Max representable e4m3 = (1 + 7/8) * 2^8 = 15/8 * 256 = 480; the
+    # OCP spec uses 448 as the "maxnormal" via the bit pattern 0x7e
+    # (mantissa 0b110, exp 0b1111). Saturate above that.
+    max_normal = 448.0
+    if a >= max_normal:
+        return sign | 0x7e
+    # Decompose to mantissa/exponent.
+    m, e = math.frexp(a)   # a = m * 2^e, 0.5 <= m < 1
+    # Rebase to 1 <= m < 2.
+    m *= 2.0
+    e -= 1
+    biased_e = e + 7
+    if biased_e <= 0:
+        # Subnormal: m_norm = a * 2^(7-1) / 2^biased_e = a / 2^(-7+1)
+        # round the 3-bit mantissa.
+        sub = round(a * (1 << 9))   # = a / 2^-9
+        if sub == 0:
+            return sign
+        return sign | (sub & 0x7f)
+    if biased_e >= 16:
+        return sign | 0x7e   # saturate
+    # Normal: mantissa m_int = round((m - 1) * 8) within [0, 7].
+    m_int = round((m - 1.0) * 8.0)
+    if m_int >= 8:
+        m_int = 0
+        biased_e += 1
+        if biased_e >= 16:
+            return sign | 0x7e
+    return sign | (biased_e << 3) | m_int
+
+
+def _fp8_e4m3_bits_to_fp32(bits: int) -> float:
+    """Inverse: decode an 8-bit fp8 e4m3 pattern back to fp32."""
+    bits &= 0xff
+    sign = -1.0 if (bits & 0x80) else 1.0
+    payload = bits & 0x7f
+    if payload == 0x7f:
+        return float("nan")
+    biased_e = (payload >> 3) & 0x0f
+    m_int = payload & 0x07
+    if biased_e == 0:
+        # Subnormal: value = sign * m_int * 2^-9
+        return sign * m_int * (2 ** -9)
+    e = biased_e - 7
+    return sign * (1.0 + m_int / 8.0) * (2.0 ** e)
+
+
+def fp8_e4m3_quantize(t: torch.Tensor) -> torch.Tensor:
+    """Quantise an fp32 tensor to fp8 e4m3 bit patterns (returned as int8).
+
+    Each element is independently rounded to the nearest representable
+    fp8 e4m3 value. Saturating: values above the max representable
+    magnitude (448) clamp to the maxnormal pattern. Output dtype is
+    ``torch.int8`` carrying the 8-bit raw pattern.
+
+    Use the ``fp8_e4m3_dequantize`` companion to round-trip back to
+    fp32 for comparison; the round-trip error is the fp8 quantisation
+    noise (substantially less than int8 PTQ noise on transformer
+    weights, which is why fp8 is preferred).
+    """
+    f = t.to(torch.float32).flatten().tolist()
+    bits = [_fp32_to_fp8_e4m3_bits(float(x)) for x in f]
+    raw = torch.tensor(bits, dtype=torch.uint8).view(t.shape).to(torch.int8)
+    return raw
+
+
+def fp8_e4m3_dequantize(raw: torch.Tensor) -> torch.Tensor:
+    """Decode fp8 e4m3 bit patterns (in int8 storage) back to fp32."""
+    raw_u = raw.to(torch.int64) & 0xff
+    flat = raw_u.flatten().tolist()
+    out = [_fp8_e4m3_bits_to_fp32(int(b)) for b in flat]
+    return torch.tensor(out, dtype=torch.float32).view(raw.shape)
 
 
 def dequantize(qt: QuantizedTensor) -> torch.Tensor:
