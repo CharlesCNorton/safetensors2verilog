@@ -54,4 +54,3 @@ Recently shipped (not in this list):
 3. Run `emit_vivado_tcl` output through Vivado and check in the resulting utilization + timing reports.
 4. Run `emit_quartus_qsf` output through `quartus_sh -t` and check in the fit + STA reports.
 5. Run `emit_synopsys_dc_tcl` output through `dc_shell` and check in the area + timing reports.
-6. Cross-check `llama_int_reference_one_layer` output bit-exactly against the Verilog the `hf_llama` frontend emits (the current cross-check verifies elaboration + cycle bound; bit-exact diff requires a LUT-bit-exact Python mirror of the rsqrt / silu / softmax LUTs).
