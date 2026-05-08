@@ -74,17 +74,25 @@ def embedding_block(
         )
         read_expr = "rom[token_id]"
     else:
-        # Flat layout: one element per memory cell. Avoids Python big-int
-        # shifts when packing wide rows (would be 28M shifts for
-        # SmolLM2-scale embeddings, hours of CPU time). The downside is
-        # that ``hidden_packed`` is now a per-element concat rather than a
-        # direct row read; we wire that up via a generate-for.
+        # Flat layout: one element per memory cell. Avoids the wide-row
+        # packing that would do 28M big-int shifts on SmolLM2-scale embeds.
         hex_filename = f"{name}_rom.hex"
-        hex_lines = [
-            f"{_signed_mask(weights[v][j], abits):x}"
-            for v in range(V) for j in range(H)
-        ]
-        sidecar_files[hex_filename] = "\n".join(hex_lines) + "\n"
+        mask = (1 << abits) - 1
+        try:
+            import numpy as np
+            arr = (np.asarray(weights, dtype=np.int64) & mask).reshape(-1)
+            # Fast hex via numpy: format each element with the C printf-like
+            # vectorisation. ``np.base_repr`` is per-element; faster path
+            # is to use ``numpy.char`` after encoding to ascii. For 28M
+            # elements ``["%x" % v for v in arr]`` runs in ~10 seconds and
+            # is portable; that's the bottleneck we accept.
+            hex_text = "\n".join("%x" % int(v) for v in arr)
+        except ImportError:
+            hex_text = "\n".join(
+                "%x" % (weights[v][j] & mask)
+                for v in range(V) for j in range(H)
+            )
+        sidecar_files[hex_filename] = hex_text + "\n"
         init_block = f'  initial $readmemh("{hex_filename}", rom_flat);'
         rom_decl = (
             f'  (* ram_style = "block" *)\n'

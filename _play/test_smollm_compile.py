@@ -122,15 +122,19 @@ def main() -> int:
             print(f"  {line}")
         return 1
 
-    print("Running simulation...")
+    print("Running simulation (writing vvp stdout to log.txt)...")
     t0 = _time.time()
-    proc = subprocess.run(
-        ["vvp", str(vvp)], cwd=str(OUT),
-        capture_output=True, text=True, timeout=1800,
-    )
+    log_path = OUT / "log.txt"
+    with open(log_path, "wb") as logf:
+        proc = subprocess.run(
+            ["vvp", str(vvp)], cwd=str(OUT),
+            stdout=logf, stderr=subprocess.STDOUT,
+            timeout=3600,
+        )
     print(f"  vvp returned {proc.returncode} in {_time.time()-t0:.1f}s")
-    log = proc.stdout
-    (OUT / "log.txt").write_text(log, encoding="utf-8")
+    print(f"  log size: {log_path.stat().st_size/1e6:.1f} MB")
+    # Print just the lines we care about
+    log = log_path.read_text(encoding="utf-8", errors="replace")
     for line in log.splitlines():
         if "DONE" in line or "TIMEOUT" in line:
             print(f"  {line[:200]}")
