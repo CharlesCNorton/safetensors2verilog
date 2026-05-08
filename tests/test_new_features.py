@@ -264,6 +264,54 @@ def test_onnx_topology_sigmoid_emits_instance_gate():
         assert any(t.startswith("sigmoid_lut") for t in sub_tops)
 
 
+def test_onnx_topology_layernorm_emits_block_with_clock():
+    """ONNX LayerNormalization wires through a layer_norm_block instance
+    and adds clk/rst/start to the parent's external port list."""
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper, numpy_helper as _nh
+    from safetensors2verilog.core import registry
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        op = td / "model.onnx"
+        sp = td / "w.safetensors"
+        x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 8])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8])
+        scale = _nh.from_array(
+            torch.ones(8, dtype=torch.float32).numpy(), name="ln_s"
+        )
+        bias = _nh.from_array(
+            torch.zeros(8, dtype=torch.float32).numpy(), name="ln_b"
+        )
+        node = helper.make_node(
+            "LayerNormalization", ["x", "ln_s", "ln_b"], ["y"], "ln1",
+            axis=-1, epsilon=1e-5,
+        )
+        graph = helper.make_graph(
+            [node], "g", [x], [y], [scale, bias],
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 17)]
+        )
+        onnx.save(model, str(op))
+        save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
+
+        ir = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=8,
+        )
+        kinds = {g.kind for g in ir.gates}
+        assert "instance" in kinds
+        # Clock + reset + start were threaded into the external port list.
+        in_names = [s.name for s in ir.inputs]
+        assert "clk" in in_names
+        assert "rst" in in_names
+        assert "start" in in_names
+        # The layer_norm submodule (and its rsqrt LUT companion) are present.
+        sub_tops = [s.top for s in ir.submodules]
+        assert any(t.startswith("layer_norm") for t in sub_tops)
+        assert any(t.startswith("rsqrt_lut") for t in sub_tops)
+
+
 def test_onnx_topology_exp_emits_instance_gate():
     onnx = pytest.importorskip("onnx")
     from onnx import TensorProto, helper

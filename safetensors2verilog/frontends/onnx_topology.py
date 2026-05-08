@@ -173,6 +173,10 @@ class OnnxTopologyFrontend(Frontend):
         # module name so multiple identical-shape instances share one
         # emitted RawSubmodule.
         _onnx_pending_submodules: list = []
+        # Set to True when a sequential op (LayerNormalization, etc.) is
+        # emitted; in that case clk/rst/start get added to the graph's
+        # external inputs so the user can drive them.
+        _needs_clock = False
 
         # Maps ONNX value names -> list of IR signal names (one per element)
         # plus the (width, signed) of each.
@@ -493,6 +497,103 @@ class OnnxTopologyFrontend(Frontend):
                 val_widths[outs[0]] = relu_width
                 val_signed[outs[0]] = True
 
+            elif op == "LayerNormalization":
+                # ONNX LayerNormalization: y = ((x - mean(x)) / sqrt(var(x)
+                # + eps)) * scale + bias. Lowered to a single
+                # ``layer_norm_block`` instance.
+                from ..blocks.layer_norm import layer_norm_block
+                attrs = {a.name: a for a in node.attribute}
+                eps = float(attrs["epsilon"].f) if "epsilon" in attrs else 1e-5
+                scale_name = ins[1] if len(ins) > 1 else None
+                bias_name  = ins[2] if len(ins) > 2 else None
+                if scale_name is None or scale_name not in initializers:
+                    raise ValueError(
+                        f"LayerNormalization '{node.name}': scale (gamma) "
+                        f"must be an initializer; got {scale_name!r}"
+                    )
+                gamma_t = initializers[scale_name].to(torch.float32)
+                if not _is_integer_tensor(gamma_t):
+                    # Quantise to Q1.14 signed
+                    gamma_int = [
+                        max(-(1 << 15),
+                            min((1 << 15) - 1,
+                                int(round(float(v) * (1 << 14)))))
+                        for v in gamma_t.flatten().tolist()
+                    ]
+                else:
+                    gamma_int = _to_int_list_1d(gamma_t)
+                if bias_name and bias_name in initializers:
+                    beta_t = initializers[bias_name].to(torch.float32)
+                    beta_int = [
+                        max(-(1 << 15),
+                            min((1 << 15) - 1, int(round(float(v)))))
+                        for v in beta_t.flatten().tolist()
+                    ]
+                else:
+                    beta_int = [0] * len(gamma_int)
+
+                in_sigs = val_signals[ins[0]]
+                K = len(in_sigs)
+                if len(gamma_int) != K:
+                    raise ValueError(
+                        f"LayerNormalization '{node.name}': scale length "
+                        f"{len(gamma_int)} != input length {K}"
+                    )
+                ln, rsq = layer_norm_block(
+                    K=K, gamma_int=gamma_int, beta_int=beta_int,
+                    abits=val_widths[ins[0]], obits=val_widths[ins[0]],
+                    eps=eps,
+                )
+                _onnx_pending_submodules.append(ln)
+                _onnx_pending_submodules.append(rsq)
+                _needs_clock = True
+
+                # Pack input scalars into x_packed via concat (LSB-first to
+                # match the block's expected layout).
+                pack_name = f"{node.name or f'ln_{len(gates)}'}_x_packed"
+                gates.append(Gate(
+                    name=pack_name, kind="concat",
+                    inputs=list(reversed(in_sigs)),
+                    output_width=K * val_widths[ins[0]],
+                    output_signed=False,
+                ))
+                # done extern wire + instance
+                done_name = f"{node.name or f'ln_{len(gates)}'}_done"
+                gates.append(Gate(
+                    name=done_name, kind="extern_wire", output_width=1,
+                ))
+                y_pack_name = f"{node.name or f'ln_{len(gates)}'}_y_packed"
+                gates.append(Gate(
+                    name=y_pack_name, kind="instance",
+                    inputs=["clk", "rst", "start", pack_name],
+                    attrs={
+                        "module_name": ln.top,
+                        "instance_name": (
+                            (node.name or f"ln_inst_{len(gates)}")
+                            .replace(".", "_")
+                        ),
+                        "input_ports": ["clk", "rst", "start", "x_packed"],
+                        "output_port": "y_packed",
+                        "extra_output_ports": [("done", done_name)],
+                    },
+                    output_width=K * val_widths[ins[0]], output_signed=True,
+                ))
+                # Slice back into per-element signals
+                out_sigs = []
+                obits = val_widths[ins[0]]
+                for k in range(K):
+                    sname = f"{node.name or f'ln_{len(gates)}'}.{k}"
+                    gates.append(Gate(
+                        name=sname, kind="slice",
+                        inputs=[y_pack_name],
+                        attrs={"hi": (k+1)*obits - 1, "lo": k*obits},
+                        output_width=obits, output_signed=True,
+                    ))
+                    out_sigs.append(sname)
+                val_signals[outs[0]] = out_sigs
+                val_widths[outs[0]] = obits
+                val_signed[outs[0]] = True
+
             elif op in ("Sigmoid", "Exp"):
                 # Per-element LUT-based activation. The hardware blocks live
                 # in safetensors2verilog.blocks.{sigmoid,exp} and are
@@ -608,6 +709,13 @@ class OnnxTopologyFrontend(Frontend):
                     width=val_widths[gn],
                     signed=val_signed[gn],
                 ))
+
+        if _needs_clock:
+            # A sequential op (LayerNormalization, ...) was emitted; add
+            # clk / rst / start to the external port list so the caller
+            # can drive them. (For purely combinational graphs the frontend
+            # historically didn't expose these, so only add when needed.)
+            external = [Signal("clk"), Signal("rst"), Signal("start")] + external
 
         return GateGraph(
             inputs=external,

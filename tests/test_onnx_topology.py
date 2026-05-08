@@ -143,8 +143,10 @@ def test_onnx_topology_safetensors_overrides_onnx_weights():
 
 
 def test_onnx_topology_unsupported_op_raises():
-    """An unsupported op (e.g. LayerNormalization) raises NotImplementedError
-    naming the op."""
+    """An unsupported op (e.g. BatchNormalization) raises
+    NotImplementedError naming the op. (LayerNormalization is now
+    supported; BatchNormalization needs a separate running-mean/var
+    initialiser path and is still deferred.)"""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         onnx_path = td / "model.onnx"
@@ -152,14 +154,27 @@ def test_onnx_topology_unsupported_op_raises():
 
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        scale = numpy_helper.from_array(
+        s = numpy_helper.from_array(
             torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32).numpy(),
-            name="ln_scale",
+            name="bn_s",
+        )
+        b = numpy_helper.from_array(
+            torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32).numpy(),
+            name="bn_b",
+        )
+        m = numpy_helper.from_array(
+            torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32).numpy(),
+            name="bn_m",
+        )
+        v = numpy_helper.from_array(
+            torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32).numpy(),
+            name="bn_v",
         )
         node = helper.make_node(
-            "LayerNormalization", ["x", "ln_scale"], ["y"], "ln", axis=-1,
+            "BatchNormalization",
+            ["x", "bn_s", "bn_b", "bn_m", "bn_v"], ["y"], "bn",
         )
-        graph = helper.make_graph([node], "g", [x], [y], [scale])
+        graph = helper.make_graph([node], "g", [x], [y], [s, b, m, v])
         model = helper.make_model(
             graph, opset_imports=[helper.make_opsetid("", 17)]
         )
@@ -167,7 +182,7 @@ def test_onnx_topology_unsupported_op_raises():
 
         save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(st_path))
 
-        with pytest.raises(NotImplementedError, match="LayerNormalization"):
+        with pytest.raises(NotImplementedError, match="BatchNormalization"):
             registry.get("onnx_topology")().parse(st_path, onnx=str(onnx_path))
 
 
