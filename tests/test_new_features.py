@@ -944,8 +944,12 @@ def test_llama_int_reference_matches_hf_llama_verilog_on_tiny_fixture():
         # done goes high.
         token_id = 0
         position = 0
+        # lut_exact=True so the Python reference uses the same Q-format
+        # LUTs the Verilog uses (rsqrt + sigmoid + silu); without this
+        # flag the reference uses float math and drifts a few LSBs.
         ref = llama_int_reference_one_layer(
             config=cfg, state_dict=sd, token_id=token_id, position=position,
+            lut_exact=True,
         )
 
         # Build the testbench. token_id width is ceil(log2(VOCAB)) = 3 for
@@ -1007,20 +1011,17 @@ endmodule
             v -= (1 << abits)
         sim_vec.append(v)
     ref_vec = ref.tolist()
-    # Verify the Verilog elaborates, runs to done within bounded cycles,
-    # and produces output of the right shape. A bit-exact comparison
-    # against the Python int reference (which uses float rsqrt while the
-    # Verilog uses a fixed-point LUT) would need a LUT-bit-exact Python
-    # mirror; that mirror is not yet wired up. The cycle bound + shape
-    # check catches the failure modes (frontend emit divergence, FSM
-    # deadlock, port-width mismatch) we'd actually want a test for here.
     cycles_str = done_line.split("cycles=")[1].split()[0]
     cycles = int(cycles_str)
     assert 0 < cycles < 10_000, f"unexpected cycle count {cycles}"
     assert len(sim_vec) == HID
-    assert all(-128 <= v <= 127 for v in sim_vec)
-    # Sanity: the int reference also bounds to int8 range.
-    assert all(-128 <= int(v) <= 127 for v in ref_vec)
+    # Now bit-exact: the Python reference's LUT mirrors compute the
+    # same Q-format integer arithmetic as the Verilog does, so every
+    # element of final_norm should match.
+    assert sim_vec == ref_vec, (
+        f"Verilog vs LUT-exact int reference disagree:\n"
+        f"  Verilog: {sim_vec}\n  Reference: {ref_vec}"
+    )
 
 
 def test_matmul_streaming_block_bit_exact_against_torch():

@@ -277,9 +277,14 @@ def build_llama_graph(
             f"({VOCAB}, {HID})"
         )
     embed_int = _embed_int_from_bf16(embed_weight, abits=abits)
+    # Use the flat $readmemh sidecar path explicitly (chunked=False)
+    # to keep the emitted .v file small enough for verilator. The
+    # chunked path inlines its ROM init blocks, which bloats SmolLM2-
+    # scale embeddings to hundreds of MB of Verilog text. The flat path
+    # writes a compact .hex sidecar that the simulator loads at runtime.
     embed_sub = embedding_block(
         V=VOCAB, H=HID, abits=abits, weights=embed_int,
-        # inline_init=None autoselects based on V*H size
+        chunked=False,
     )
     submodules.append(embed_sub)
     gates.append(_instance(

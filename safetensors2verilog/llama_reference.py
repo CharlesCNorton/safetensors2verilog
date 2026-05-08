@@ -34,6 +34,7 @@ from .calibration import (
     _gelu_int, _quantize_input_tokens, _quantize_per_channel_int,
     _rms_norm_int_reference, _silu_int,
 )
+from .lut_reference import rms_norm_lut_eval, silu_lut_eval
 
 
 def llama_int_reference_one_layer(
@@ -45,8 +46,15 @@ def llama_int_reference_one_layer(
     abits: int = 8,
     weight_bits: int = 8,
     requantize_params: list[dict[str, dict[str, list[int]]]] | None = None,
+    lut_exact: bool = False,
 ) -> torch.Tensor:
     """Bit-stable int reference of one transformer layer + final_norm.
+
+    When ``lut_exact=True``, RMSNorm + SiLU use the bit-exact LUT mirrors
+    in ``safetensors2verilog.lut_reference`` instead of the float-math
+    helpers. This makes the reference output bit-identical to the
+    Verilog the ``hf_llama`` frontend emits when both run with the same
+    requantize parameters.
 
     Returns the post-final-norm hidden vector (length ``hidden_size``,
     int32 elements bounded to int8 range).
@@ -129,8 +137,14 @@ def llama_int_reference_one_layer(
         sh = weight_bits + max(1, (K - 1).bit_length()) - 2
         return (acc >> sh).clamp(-qmax_a, qmax_a)
 
-    norm1 = _rms_norm_int_reference(hidden, g1, gamma_bits=16,
-                                     eps=EPS, abits=abits)
+    if lut_exact:
+        norm1 = torch.tensor(rms_norm_lut_eval(
+            hidden.tolist(), g1, K=HID, abits=abits, gamma_bits=16,
+            obits=abits, eps=EPS,
+        ), dtype=torch.int32)
+    else:
+        norm1 = _rms_norm_int_reference(hidden, g1, gamma_bits=16,
+                                         eps=EPS, abits=abits)
     q_acc = (Wq.to(torch.int64) @ norm1.to(torch.int64))
     k_acc = (Wk.to(torch.int64) @ norm1.to(torch.int64))
     v_acc = (Wv.to(torch.int64) @ norm1.to(torch.int64))
@@ -151,20 +165,37 @@ def llama_int_reference_one_layer(
     o_int = chained(o_acc, 0, "o")
     hidden = (hidden + o_int).clamp(-qmax_a, qmax_a)
 
-    norm2 = _rms_norm_int_reference(hidden, g2, gamma_bits=16,
-                                     eps=EPS, abits=abits)
+    if lut_exact:
+        norm2 = torch.tensor(rms_norm_lut_eval(
+            hidden.tolist(), g2, K=HID, abits=abits, gamma_bits=16,
+            obits=abits, eps=EPS,
+        ), dtype=torch.int32)
+    else:
+        norm2 = _rms_norm_int_reference(hidden, g2, gamma_bits=16,
+                                         eps=EPS, abits=abits)
     g_acc = (Wg.to(torch.int64) @ norm2.to(torch.int64))
     u_acc = (Wu.to(torch.int64) @ norm2.to(torch.int64))
     g_int = chained(g_acc, 0, "gate")
     u_int = chained(u_acc, 0, "up")
-    silu_g = act_fn(g_int, abits)
+    if lut_exact and HIDDEN_ACT in ("silu", "swiglu"):
+        silu_g = torch.tensor(silu_lut_eval(
+            g_int.tolist(), abits=abits, obits=abits,
+        ), dtype=torch.int32)
+    else:
+        silu_g = act_fn(g_int, abits)
     elt = ((silu_g * u_int) >> 4).clamp(-qmax_a, qmax_a)
     d_acc = (Wd.to(torch.int64) @ elt.to(torch.int64))
     d_int = chained(d_acc, 0, "down")
     hidden = (hidden + d_int).clamp(-qmax_a, qmax_a)
 
-    final = _rms_norm_int_reference(hidden, gn, gamma_bits=16,
-                                     eps=EPS, abits=abits)
+    if lut_exact:
+        final = torch.tensor(rms_norm_lut_eval(
+            hidden.tolist(), gn, K=HID, abits=abits, gamma_bits=16,
+            obits=abits, eps=EPS,
+        ), dtype=torch.int32)
+    else:
+        final = _rms_norm_int_reference(hidden, gn, gamma_bits=16,
+                                         eps=EPS, abits=abits)
     return final.to(torch.int32)
 
 
