@@ -29,7 +29,7 @@ def main() -> int:
         return 2
 
     print("Loading SmolLM2-135M-Instruct via hf_llama frontend...")
-    print("  num_layers_override=1, max_seq_override=4")
+    print("  num_layers_override=1, max_seq_override=4, skip_lm_head=True")
     fe = registry.get("hf_llama")()
     graph = fe.parse(
         SMOLLM_DIR / "model.safetensors",
@@ -37,6 +37,7 @@ def main() -> int:
         config=str(SMOLLM_DIR / "config.json"),
         activation_bits=8, weight_bits=8,
         num_layers_override=1, max_seq_override=4,
+        skip_lm_head=True,
     )
     n_subs = len(graph.submodules)
     print(f"GateGraph: {len(graph.gates)} gates, {n_subs} submodules")
@@ -63,12 +64,76 @@ def main() -> int:
         print("iverilog not on PATH; stopping after emission.")
         return 0
 
-    print("\nThis is the point in the trajectory where iverilog compile + sim")
-    print("of a 1-layer SmolLM2 takes minutes. Skipping the actual sim run")
-    print("here; the frontend produced a self-consistent Verilog package.")
-    print(f"\nTo simulate, in {OUT}:")
-    print(f"  iverilog -g2012 -o smollm.vvp smollm_l1.v <a testbench>")
-    print(f"  vvp smollm.vvp")
+    # Build a testbench that drives one token, waits for done, captures
+    # the final_norm hidden vector.
+    pos_bits = max(1, (4 - 1).bit_length() + 1)   # MAX_SEQ=4
+    HID = 576
+    ABITS = 8
+    VOCAB = 49152
+    token_bits = max(1, (VOCAB - 1).bit_length())
+
+    tb = (
+        "`timescale 1ns/1ps\n"
+        "module tb;\n"
+        "  reg clk = 0; always #5 clk = ~clk;\n"
+        "  reg rst = 1, start = 0;\n"
+        f"  reg [{token_bits-1}:0] token_id;\n"
+        f"  reg [{pos_bits-1}:0] position;\n"
+        "  wire done;\n"
+        f"  wire signed [{HID*ABITS-1}:0] final_norm;\n"
+        "  smollm_l1 dut(.clk(clk), .rst(rst), .start(start),\n"
+        "                .token_id(token_id), .position(position),\n"
+        "                .done(done), .final_norm(final_norm));\n"
+        "  integer cycles;\n"
+        "  initial begin\n"
+        "    rst = 1; #20 rst = 0;\n"
+        "    @(negedge clk);\n"
+        f"      token_id = {token_bits}'d42;\n"
+        "      position = 0;\n"
+        "      start <= 1;\n"
+        "    @(negedge clk); start <= 0;\n"
+        "    cycles = 0;\n"
+        "    while (!done) begin\n"
+        "      @(posedge clk);\n"
+        "      cycles = cycles + 1;\n"
+        "      if (cycles > 200000) begin $display(\"TIMEOUT\"); $finish; end\n"
+        "    end\n"
+        "    $display(\"DONE %0d cycles  final_norm=%h\", cycles, final_norm);\n"
+        "    $finish;\n"
+        "  end\n"
+        "endmodule\n"
+    )
+    tb_path = OUT / "tb.v"
+    tb_path.write_text(tb, encoding="utf-8")
+    print(f"\nWrote testbench {tb_path}")
+
+    print("Compiling with iverilog...")
+    import time as _time
+    t0 = _time.time()
+    vvp = OUT / "smollm.vvp"
+    proc = subprocess.run(
+        ["iverilog", "-g2012", "-o", str(vvp), str(v_path), str(tb_path)],
+        cwd=str(OUT), capture_output=True, text=True, timeout=1200,
+    )
+    print(f"  iverilog returned {proc.returncode} in {_time.time()-t0:.1f}s")
+    if proc.returncode != 0:
+        print("STDERR (last 50 lines):")
+        for line in proc.stderr.splitlines()[-50:]:
+            print(f"  {line}")
+        return 1
+
+    print("Running simulation...")
+    t0 = _time.time()
+    proc = subprocess.run(
+        ["vvp", str(vvp)], cwd=str(OUT),
+        capture_output=True, text=True, timeout=1800,
+    )
+    print(f"  vvp returned {proc.returncode} in {_time.time()-t0:.1f}s")
+    log = proc.stdout
+    (OUT / "log.txt").write_text(log, encoding="utf-8")
+    for line in log.splitlines():
+        if "DONE" in line or "TIMEOUT" in line:
+            print(f"  {line[:200]}")
     return 0
 
 

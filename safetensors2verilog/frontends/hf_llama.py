@@ -63,6 +63,9 @@ from ..blocks.argmax import argmax_block
 from ..blocks.attention import attention_step_block
 from ..blocks.embedding import embedding_block
 from ..blocks.matmul import matmul_seq_block
+from ..blocks.matmul_stream import (
+    argmax_stream_block, matmul_streaming_block,
+)
 from ..blocks.requantize import requantize_block
 from ..blocks.rms_norm import rms_norm_block
 from ..blocks.rope import rope_block
@@ -227,6 +230,8 @@ def build_llama_graph(
     top: str = "llama_top",
     abits: int = DEFAULT_ACT_BITS,
     weight_bits: int = DEFAULT_WEIGHT_BITS,
+    skip_lm_head: bool = False,
+    streaming_lm_head_threshold: int = 1024,
 ) -> GateGraph:
     """Build the per-token forward-pass GateGraph for a LLaMA-architecture model.
 
@@ -628,13 +633,109 @@ def build_llama_graph(
         output_width=HID * abits, output_signed=True,
     ))
 
+    pos_bits = max(1, (MAX_SEQ - 1).bit_length() + 1)
+    idx_bits = max(1, (VOCAB - 1).bit_length())
+
+    if skip_lm_head:
+        # Expose final_norm hidden directly (do lm_head + argmax on CPU).
+        # Avoids the 49152-output matmul that blows up iverilog parse time
+        # at SmolLM2 scale; useful for verifying everything up to the final
+        # hidden state.
+        parent = GateGraph(
+            inputs=[
+                Signal("clk"), Signal("rst"), Signal("start"),
+                Signal("token_id", width=max(1, (VOCAB - 1).bit_length()),
+                       signed=False),
+                Signal("position", width=pos_bits, signed=False),
+            ],
+            outputs=[
+                Signal("done", width=1),
+                Signal("final_norm", width=HID * abits, signed=True),
+            ],
+            gates=gates + [
+                Gate(name="done", kind="or", inputs=["rmsf.done"],
+                     output_width=1, output_signed=False),
+            ],
+            top=top, submodules=submodules,
+        )
+        return parent
+
     # --- lm_head ---
     if TIE:
-        # Use the embedding weights as lm_head
         lm_W = embed_int
     else:
         lm_W, _sl = _quantize_linear_weight(
             state_dict["lm_head.weight"], weight_bits)
+
+    use_streaming = VOCAB >= streaming_lm_head_threshold
+    if use_streaming:
+        # Streaming matmul (one MAC, M*K cycles) feeding a streaming argmax.
+        # Avoids the parallel-matmul's M parallel weight ROMs at large vocab.
+        lm_stream = matmul_streaming_block(
+            weights=lm_W, weight_bits=weight_bits, act_bits=abits,
+            module_suffix="lm_head",
+        )
+        am_stream = argmax_stream_block(M=VOCAB, abits=lm_obits)
+        submodules += [lm_stream, am_stream]
+
+        gates.append(Gate(name="lm.j_idx", kind="extern_wire",
+                          output_width=max(1, (VOCAB - 1).bit_length() + 1)))
+        gates.append(Gate(name="lm.y_value", kind="extern_wire",
+                          output_width=lm_obits, output_signed=True))
+        gates.append(Gate(name="lm.done", kind="extern_wire", output_width=1))
+        # The instance gate's name BECOMES the parent wire for the primary
+        # output port (y_valid).
+        gates.append(_instance(
+            name="lm.y_valid", module=lm_stream.top, instance_name="lm",
+            input_ports=["clk", "rst", "start", "x_packed"],
+            inputs=["clk", "rst", "rmsf.done", "final_norm"],
+            output_port="y_valid",
+            extra_outputs=[
+                ("j_idx",   "lm.j_idx"),
+                ("y_value", "lm.y_value"),
+                ("done",    "lm.done"),
+            ],
+            output_width=1, output_signed=False,
+        ))
+
+        # Reset the streaming argmax on rmsf.done (when lm_head starts).
+        gates.append(Gate(name="argmax_value", kind="extern_wire",
+                          output_width=lm_obits, output_signed=True))
+        gates.append(_instance(
+            name="next_token_id", module=am_stream.top, instance_name="am",
+            input_ports=["clk", "rst", "start",
+                         "y_valid", "j_idx", "y_value"],
+            inputs=["clk", "rst", "rmsf.done",
+                    "lm.y_valid", "lm.j_idx", "lm.y_value"],
+            output_port="argmax_idx",
+            extra_outputs=[("argmax_value", "argmax_value")],
+            output_width=idx_bits, output_signed=False,
+        ))
+
+        # Top-level: expose just next_token_id + done + argmax_value.
+        # No logits_packed (would be VOCAB*OBITS bits which is huge for
+        # large VOCAB).
+        parent = GateGraph(
+            inputs=[
+                Signal("clk"), Signal("rst"), Signal("start"),
+                Signal("token_id", width=max(1, (VOCAB - 1).bit_length()),
+                       signed=False),
+                Signal("position", width=pos_bits, signed=False),
+            ],
+            outputs=[
+                Signal("done", width=1),
+                Signal("next_token_id", width=idx_bits, signed=False),
+                Signal("argmax_value", width=lm_obits, signed=True),
+            ],
+            gates=gates + [
+                Gate(name="done", kind="or", inputs=["lm.done"],
+                     output_width=1, output_signed=False),
+            ],
+            top=top, submodules=submodules,
+        )
+        return parent
+
+    # Default: parallel matmul + combinational argmax.
     lm_sub = matmul_seq_block(weights=lm_W, weight_bits=weight_bits,
                               act_bits=abits, module_suffix="lm_head")
     submodules.append(lm_sub)
@@ -648,10 +749,8 @@ def build_llama_graph(
         output_width=VOCAB * lm_obits, output_signed=True,
     ))
 
-    # --- argmax (combinational) ---
     argmax_sub = argmax_block(K=VOCAB, abits=lm_obits)
     submodules.append(argmax_sub)
-    idx_bits = max(1, (VOCAB - 1).bit_length())
     gates.append(_instance(
         name="next_token_id", module=argmax_sub.top, instance_name="am",
         input_ports=["x_packed"], inputs=["logits_packed"],
@@ -659,8 +758,6 @@ def build_llama_graph(
         output_width=idx_bits, output_signed=False,
     ))
 
-    # --- Build top-level GateGraph ---
-    pos_bits = max(1, (MAX_SEQ - 1).bit_length() + 1)
     parent = GateGraph(
         inputs=[
             Signal("clk"), Signal("rst"), Signal("start"),
@@ -732,6 +829,15 @@ class HFLlamaFrontend(Frontend):
                      "(0 = use config value). Useful for compiling a "
                      "subset of layers (the first N) for testing.",
             ),
+            FrontendOption(
+                name="skip-lm-head",
+                type=bool,
+                default=False,
+                help="emit through final_norm only (skip the lm_head "
+                     "matmul + argmax). Useful for SmolLM2-scale models "
+                     "where the 49152-output lm_head dominates iverilog "
+                     "parse time; the lm_head + argmax can be done on CPU.",
+            ),
         ]
 
     def parse(
@@ -743,6 +849,7 @@ class HFLlamaFrontend(Frontend):
         weight_bits: int = DEFAULT_WEIGHT_BITS,
         max_seq_override: int = 0,
         num_layers_override: int = 0,
+        skip_lm_head: bool = False,
         **options,
     ) -> GateGraph:
         path = Path(path)
@@ -770,4 +877,5 @@ class HFLlamaFrontend(Frontend):
         return build_llama_graph(
             config=cfg, state_dict=state_dict, top=top,
             abits=activation_bits, weight_bits=weight_bits,
+            skip_lm_head=skip_lm_head,
         )
