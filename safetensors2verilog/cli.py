@@ -821,7 +821,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.sidecar_layout is not None and args.output is not None:
-        from .core import write_sidecar_files
+        from .core import (
+            RawSubmodule, rewrite_readmemh_paths, write_sidecar_files,
+        )
         sidecar_dir = args.output.parent
         tarball_path = (
             args.sidecar_tarball
@@ -838,6 +840,29 @@ def main(argv: list[str] | None = None) -> int:
             f"{stats['modules']} module(s) ({stats['bytes']/1024:.1f} KB) "
             f"using layout '{args.sidecar_layout}'"
         )
+        # When the sidecar files moved into per-module subdirectories
+        # (or got bundled into a tarball that the user will extract into
+        # similar subdirs), rewrite the .v file's `$readmemh("FILE.hex"`
+        # calls to include the module-name prefix so the Verilog stays
+        # self-contained without manual include-path management.
+        if args.sidecar_layout in ("subdirs", "tarball"):
+            path_map: dict[str, str] = {}
+
+            def collect_map(g: GateGraph) -> None:
+                for sub in g.submodules:
+                    if isinstance(sub, RawSubmodule):
+                        for fn in sub.sidecar_files:
+                            path_map[fn] = f"{sub.top}/{fn}"
+                    else:
+                        collect_map(sub)
+            collect_map(graph)
+            if path_map:
+                rewritten = rewrite_readmemh_paths(text, path_map)
+                args.output.write_text(rewritten, encoding="utf-8")
+                _info(
+                    f"rewrote {len(path_map)} $readmemh path(s) in "
+                    f"{args.output} for layout '{args.sidecar_layout}'"
+                )
 
     if args.emit_sdc is not None:
         sdc_text = _emit_sdc_template(graph, args.sdc_period_ns)

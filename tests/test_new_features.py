@@ -3072,8 +3072,9 @@ def test_onnx_topology_attention_emits_softmax_and_mul_chain():
         assert "clk" in in_names and "rst" in in_names and "start" in in_names
 
 
-def test_onnx_topology_attention_rejects_multi_head():
-    """ONNX Attention with num_heads > 1 raises pointing at hf_llama."""
+def test_onnx_topology_attention_accepts_multi_head():
+    """ONNX Attention with num_heads > 1 is now supported; parse should
+    return an IR graph rather than raising."""
     onnx = pytest.importorskip("onnx")
     from onnx import TensorProto, helper
     from safetensors2verilog.core import registry
@@ -3082,10 +3083,12 @@ def test_onnx_topology_attention_rejects_multi_head():
         td = Path(td)
         op = td / "model.onnx"
         sp = td / "w.safetensors"
-        q = helper.make_tensor_value_info("q", TensorProto.FLOAT, [1, 4])
-        k = helper.make_tensor_value_info("k", TensorProto.FLOAT, [1, 4])
-        v = helper.make_tensor_value_info("v", TensorProto.FLOAT, [1, 4])
-        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+        # Multi-head requires per-head element count divisible into a
+        # square seq * d_k. Use 2 heads x seq=2 x d_k=2 -> per_head=4.
+        q = helper.make_tensor_value_info("q", TensorProto.FLOAT, [1, 8])
+        k = helper.make_tensor_value_info("k", TensorProto.FLOAT, [1, 8])
+        v = helper.make_tensor_value_info("v", TensorProto.FLOAT, [1, 8])
+        y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 8])
         node = helper.make_node(
             "Attention", ["q", "k", "v"], ["y"], "att1",
             num_heads=2,
@@ -3096,10 +3099,15 @@ def test_onnx_topology_attention_rejects_multi_head():
         )
         onnx.save(model, str(op))
         save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(sp))
-        with pytest.raises(NotImplementedError, match="num_heads"):
-            registry.get("onnx_topology")().parse(
-                sp, onnx=str(op), activation_bits=8,
-            )
+        ir = registry.get("onnx_topology")().parse(
+            sp, onnx=str(op), activation_bits=8,
+        )
+        kinds = {g.kind for g in ir.gates}
+        assert "instance" in kinds
+        # Per-head naming is visible in the gate names.
+        gate_names = {g.name for g in ir.gates}
+        assert any(".h0." in n for n in gate_names)
+        assert any(".h1." in n for n in gate_names)
 
 
 def test_onnx_topology_softmax_emits_block_with_clock():

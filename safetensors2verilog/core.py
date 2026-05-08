@@ -250,6 +250,33 @@ def collect_sidecar_files(
     return out
 
 
+def rewrite_readmemh_paths(
+    verilog_text: str,
+    path_map: dict[str, str],
+) -> str:
+    """Rewrite ``$readmemh("OLD", ...)`` calls in ``verilog_text`` per
+    ``path_map`` (``{bare_filename: new_path}``).
+
+    Used by the CLI when ``--sidecar-layout subdirs`` is selected: each
+    sidecar hex moves under ``output_dir/<module_name>/<filename>`` and
+    the corresponding ``$readmemh`` needs the same prefix for the Verilog
+    to still resolve the file at simulation / synthesis time. Filenames
+    not in ``path_map`` are left untouched.
+    """
+    import re as _re
+
+    def repl(match: "_re.Match[str]") -> str:
+        old = match.group("path")
+        new = path_map.get(old, old)
+        return f'$readmemh("{new}"'
+
+    return _re.sub(
+        r'\$readmemh\("(?P<path>[^"]+)"',
+        repl,
+        verilog_text,
+    )
+
+
 def write_sidecar_files(
     graph: "GateGraph",
     output_dir: "Path",

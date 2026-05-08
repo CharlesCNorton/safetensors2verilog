@@ -11,6 +11,7 @@ from .core import (
     Signal,
     collect_sidecar_files,
     registry,
+    rewrite_readmemh_paths,
     write_sidecar_files,
 )
 from .evaluate import evaluate_graph, step_graph
@@ -34,6 +35,7 @@ __all__ = [
     "Signal",
     "registry",
     "collect_sidecar_files",
+    "rewrite_readmemh_paths",
     "write_sidecar_files",
     "emit_module",
     "emit_bram_template",

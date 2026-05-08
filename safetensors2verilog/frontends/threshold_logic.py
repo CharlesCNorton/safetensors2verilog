@@ -92,6 +92,67 @@ class ThresholdLogicFrontend(Frontend):
             ),
         ]
 
+    def parse_multi(
+        self, path: Path, top: str = "top", **options,
+    ) -> "list[GateGraph]":
+        """Multi-output: when the safetensors file declares more than one
+        circuit (a top-level prefix that has gates underneath), return
+        one ``GateGraph`` per prefix with the dependency closure of that
+        prefix as the gates list.
+
+        This lets a multi-circuit safetensors compile into multiple
+        independent top-level Verilog modules in one pass via the CLI's
+        ``--emit-multi DIR`` flag, without forcing the user to manage a
+        per-circuit ``--circuit`` invocation loop.
+
+        Falls back to ``[parse(path)]`` when the file contains zero or
+        one circuit prefix.
+        """
+        from ..extract import extract_subset
+        import json as _json
+        from safetensors import safe_open
+        path = Path(path)
+        # Discover top-level prefixes (the first dotted segment of every
+        # gate name, excluding the manifest).
+        prefixes: set[str] = set()
+        with safe_open(str(path), framework="pt") as f:
+            for k in f.keys():
+                for suf in (".weight", ".bias", ".inputs"):
+                    if k.endswith(suf):
+                        gate = k[: -len(suf)]
+                        if gate.startswith("manifest."):
+                            break
+                        parts = gate.split(".")
+                        if len(parts) >= 2:
+                            prefixes.add(".".join(parts[:2]))
+                        else:
+                            prefixes.add(gate)
+                        break
+        if len(prefixes) <= 1:
+            return [self.parse(path, top=top, **options)]
+
+        # Extract each prefix's closure to its own temp safetensors and
+        # parse it as an independent top.
+        import tempfile
+        graphs: list[GateGraph] = []
+        for prefix in sorted(prefixes):
+            with tempfile.TemporaryDirectory(prefix="s2v_pmulti_") as td:
+                td_p = Path(td)
+                sub_path = td_p / "subset.safetensors"
+                try:
+                    extract_subset(
+                        path, [prefix], sub_path, quiet=True,
+                    )
+                except ValueError:
+                    continue
+                # Each per-prefix graph gets a sanitised top name; "."
+                # isn't a Verilog identifier character, so swap to "_".
+                safe_top = prefix.replace(".", "_")
+                graphs.append(
+                    self.parse(sub_path, top=safe_top, **options)
+                )
+        return graphs if graphs else [self.parse(path, top=top, **options)]
+
     def parse(
         self,
         path: Path,

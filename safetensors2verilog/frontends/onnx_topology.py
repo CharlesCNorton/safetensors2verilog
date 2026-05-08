@@ -1245,19 +1245,13 @@ class OnnxTopologyFrontend(Frontend):
                 # via the standalone op rather than decomposed MatMul +
                 # Softmax + MatMul.
                 from ..blocks.softmax import softmax_block
-                if len(ins) > 3:
-                    raise NotImplementedError(
-                        f"Attention node '{node.name}': mask / past_key / "
-                        f"past_value inputs (len(ins)={len(ins)}) not yet "
-                        f"supported; only the (Q, K, V) form."
-                    )
                 attrs = {a.name: a for a in node.attribute}
                 num_heads = int(attrs["num_heads"].i) if "num_heads" in attrs else 1
-                if num_heads != 1:
+                if len(ins) > 4:
                     raise NotImplementedError(
-                        f"Attention node '{node.name}': num_heads="
-                        f"{num_heads}; only single-head supported. Use "
-                        f"the hf_llama frontend for multi-head attention."
+                        f"Attention node '{node.name}': past_key / "
+                        f"past_value inputs (len(ins)={len(ins)}) not yet "
+                        f"supported; only (Q, K, V) or (Q, K, V, mask)."
                     )
                 q_sigs = val_signals[ins[0]]
                 k_sigs = val_signals[ins[1]]
@@ -1266,135 +1260,215 @@ class OnnxTopologyFrontend(Frontend):
                 if (val_widths[ins[1]] != in_w
                         or val_widths[ins[2]] != in_w):
                     raise NotImplementedError(
-                        f"Attention node '{node.name}': Q/K/V widths "
-                        f"differ"
+                        f"Attention node '{node.name}': Q/K/V widths differ"
                     )
                 qn, kn, vn = len(q_sigs), len(k_sigs), len(v_sigs)
                 if qn != kn:
                     raise NotImplementedError(
                         f"Attention node '{node.name}': Q has {qn} "
-                        f"elements, K has {kn}; require seq*d_k equal."
+                        f"elements, K has {kn}; require equal."
                     )
-                seq_guess = int(qn ** 0.5)
-                if seq_guess * seq_guess == qn:
+                # Multi-head: Q packed as [H, seq, d_per_head] flattened
+                # to H * seq * d_per_head. seq is inferred (assumes Q
+                # and K share seq). Per-head slice indexes into the
+                # flattened bus.
+                if qn % num_heads != 0:
+                    raise ValueError(
+                        f"Attention node '{node.name}': qn={qn} not "
+                        f"divisible by num_heads={num_heads}"
+                    )
+                per_head = qn // num_heads
+                # Within a head, treat the per_head elements as
+                # [seq, d_per_head]. Try square shape first.
+                seq_guess = int(per_head ** 0.5)
+                if seq_guess * seq_guess == per_head:
                     seq, d_k = seq_guess, seq_guess
                 else:
-                    seq, d_k = 1, qn
-                if vn % seq != 0:
+                    seq, d_k = 1, per_head
+                if vn % (num_heads * seq) != 0:
                     raise NotImplementedError(
                         f"Attention node '{node.name}': V has {vn} "
-                        f"elements, not divisible by seq={seq}"
+                        f"elements, not divisible by "
+                        f"num_heads*seq = {num_heads*seq}"
                     )
-                d_v = vn // seq
+                d_v = vn // (num_heads * seq)
 
-                label = node.name or f"attn_{len(gates)}"
-                score_width = in_w * 2 + max(1, (d_k - 1).bit_length()) + 1
-                score_sigs: list[list[str]] = []
-                for i in range(seq):
-                    row = []
-                    for j in range(seq):
-                        prod_names = []
-                        for kk in range(d_k):
-                            pn = f"{label}.prod_{i}_{j}_{kk}"
-                            gates.append(Gate(
-                                name=pn, kind="mul",
-                                inputs=[q_sigs[i * d_k + kk],
-                                        k_sigs[j * d_k + kk]],
-                                output_width=2 * in_w, output_signed=True,
-                            ))
-                            prod_names.append(pn)
-                        sn = f"{label}.score_{i}_{j}"
-                        gates.append(Gate(
-                            name=sn, kind="linear",
-                            inputs=prod_names,
-                            attrs={"weights": [1] * d_k, "bias": 0},
-                            output_width=score_width, output_signed=True,
-                        ))
-                        row.append(sn)
-                    score_sigs.append(row)
+                # Optional mask: when ins[3] is supplied, use its
+                # int signals as the per-row mask. We assume the mask
+                # is packed as (seq * seq) bits in row-major order; the
+                # attention block consumes one row at a time.
+                mask_signals: list[str] | None = None
+                if len(ins) == 4 and ins[3]:
+                    if ins[3] in val_signals:
+                        mask_signals = list(val_signals[ins[3]])
+                        if len(mask_signals) != seq * seq:
+                            raise NotImplementedError(
+                                f"Attention node '{node.name}': mask "
+                                f"has {len(mask_signals)} elements, "
+                                f"expected seq*seq = {seq*seq}"
+                            )
+                    elif ins[3] in initializers:
+                        # Static mask: bake into per-row constants below.
+                        mask_signals = []
+                        mask_t = initializers[ins[3]].flatten().tolist()
+                        if len(mask_t) != seq * seq:
+                            raise NotImplementedError(
+                                f"Attention node '{node.name}': static "
+                                f"mask length {len(mask_t)} != seq*seq "
+                                f"= {seq*seq}"
+                            )
+                    else:
+                        raise NotImplementedError(
+                            f"Attention node '{node.name}': mask input "
+                            f"'{ins[3]}' is neither a value nor an "
+                            f"initializer"
+                        )
 
-                # Per-row softmax instance.
                 _needs_clock = True
                 sm_sub, exp_sub = softmax_block(K=seq, abits=8, obits=8)
                 _onnx_pending_submodules.append(exp_sub)
                 _onnx_pending_submodules.append(sm_sub)
-                weight_outs: list[list[str]] = []
-                for i in range(seq):
-                    truncated = []
-                    for j in range(seq):
-                        tn = f"{label}.score_trunc_{i}_{j}"
-                        gates.append(Gate(
-                            name=tn, kind="slice",
-                            inputs=[score_sigs[i][j]],
-                            attrs={"hi": 7, "lo": 0},
-                            output_width=8, output_signed=True,
-                        ))
-                        truncated.append(tn)
-                    pack = f"{label}.scorerow_{i}_packed"
-                    gates.append(Gate(
-                        name=pack, kind="concat",
-                        inputs=list(reversed(truncated)),
-                        output_width=seq * 8, output_signed=False,
-                    ))
-                    mask_n = f"{label}.mask_{i}"
-                    gates.append(Gate(
-                        name=mask_n, kind="constant",
-                        attrs={"value": (1 << seq) - 1},
-                        output_width=seq, output_signed=False,
-                    ))
-                    done_n = f"{label}.sm_done_{i}"
-                    gates.append(Gate(name=done_n, kind="extern_wire",
-                                      output_width=1))
-                    yp = f"{label}.weights_{i}_packed"
-                    gates.append(Gate(
-                        name=yp, kind="instance",
-                        inputs=["clk", "rst", "start", pack, mask_n],
-                        attrs={
-                            "module_name": sm_sub.top,
-                            "instance_name": (
-                                f"{label.replace('.', '_')}_sm_{i}"
-                            ),
-                            "input_ports": ["clk", "rst", "start",
-                                             "x_packed", "mask"],
-                            "output_port": "y_packed",
-                            "extra_output_ports": [("done", done_n)],
-                        },
-                        output_width=seq * 8, output_signed=False,
-                    ))
-                    row_w = []
-                    for j in range(seq):
-                        wn = f"{label}.w_{i}_{j}"
-                        gates.append(Gate(
-                            name=wn, kind="slice",
-                            inputs=[yp],
-                            attrs={"hi": (j + 1) * 8 - 1, "lo": j * 8},
-                            output_width=8, output_signed=False,
-                        ))
-                        row_w.append(wn)
-                    weight_outs.append(row_w)
 
+                label = node.name or f"attn_{len(gates)}"
+                score_width = in_w * 2 + max(1, (d_k - 1).bit_length()) + 1
                 out_width = 8 + in_w + max(1, (seq - 1).bit_length()) + 1
-                output_sigs: list[str] = []
-                for i in range(seq):
-                    for kv in range(d_v):
-                        prod_names = []
+                # Per-head output element list, concatenated at the end.
+                per_head_outputs: list[list[str]] = []
+
+                for h in range(num_heads):
+                    head_q = q_sigs[h * seq * d_k:(h + 1) * seq * d_k]
+                    head_k = k_sigs[h * seq * d_k:(h + 1) * seq * d_k]
+                    head_v = v_sigs[h * seq * d_v:(h + 1) * seq * d_v]
+                    score_sigs: list[list[str]] = []
+                    for i in range(seq):
+                        row = []
                         for j in range(seq):
-                            pn = f"{label}.outprod_{i}_{kv}_{j}"
+                            prod_names = []
+                            for kk in range(d_k):
+                                pn = f"{label}.h{h}.prod_{i}_{j}_{kk}"
+                                gates.append(Gate(
+                                    name=pn, kind="mul",
+                                    inputs=[head_q[i * d_k + kk],
+                                            head_k[j * d_k + kk]],
+                                    output_width=2 * in_w,
+                                    output_signed=True,
+                                ))
+                                prod_names.append(pn)
+                            sn = f"{label}.h{h}.score_{i}_{j}"
                             gates.append(Gate(
-                                name=pn, kind="mul",
-                                inputs=[weight_outs[i][j],
-                                        v_sigs[j * d_v + kv]],
-                                output_width=8 + in_w, output_signed=True,
+                                name=sn, kind="linear",
+                                inputs=prod_names,
+                                attrs={"weights": [1] * d_k, "bias": 0},
+                                output_width=score_width,
+                                output_signed=True,
                             ))
-                            prod_names.append(pn)
-                        sn = f"{label}.{i * d_v + kv}"
+                            row.append(sn)
+                        score_sigs.append(row)
+
+                    weight_outs: list[list[str]] = []
+                    for i in range(seq):
+                        truncated = []
+                        for j in range(seq):
+                            tn = f"{label}.h{h}.score_trunc_{i}_{j}"
+                            gates.append(Gate(
+                                name=tn, kind="slice",
+                                inputs=[score_sigs[i][j]],
+                                attrs={"hi": 7, "lo": 0},
+                                output_width=8, output_signed=True,
+                            ))
+                            truncated.append(tn)
+                        pack = f"{label}.h{h}.scorerow_{i}_packed"
                         gates.append(Gate(
-                            name=sn, kind="linear",
-                            inputs=prod_names,
-                            attrs={"weights": [1] * seq, "bias": 0},
-                            output_width=out_width, output_signed=True,
+                            name=pack, kind="concat",
+                            inputs=list(reversed(truncated)),
+                            output_width=seq * 8, output_signed=False,
                         ))
-                        output_sigs.append(sn)
+                        # Mask source: dynamic signals or all-ones default.
+                        if mask_signals is not None and isinstance(
+                            mask_signals, list,
+                        ) and len(mask_signals) > 0 and isinstance(
+                            mask_signals[0], str,
+                        ):
+                            # Dynamic per-row mask: pack the i-th row.
+                            row_mask_sigs = mask_signals[i*seq:(i+1)*seq]
+                            mask_pack = f"{label}.h{h}.maskrow_{i}_packed"
+                            gates.append(Gate(
+                                name=mask_pack, kind="concat",
+                                inputs=list(reversed(row_mask_sigs)),
+                                output_width=seq, output_signed=False,
+                            ))
+                            mask_in = mask_pack
+                        else:
+                            mask_n = f"{label}.h{h}.mask_{i}"
+                            gates.append(Gate(
+                                name=mask_n, kind="constant",
+                                attrs={"value": (1 << seq) - 1},
+                                output_width=seq, output_signed=False,
+                            ))
+                            mask_in = mask_n
+                        done_n = f"{label}.h{h}.sm_done_{i}"
+                        gates.append(Gate(
+                            name=done_n, kind="extern_wire",
+                            output_width=1,
+                        ))
+                        yp = f"{label}.h{h}.weights_{i}_packed"
+                        gates.append(Gate(
+                            name=yp, kind="instance",
+                            inputs=["clk", "rst", "start", pack, mask_in],
+                            attrs={
+                                "module_name": sm_sub.top,
+                                "instance_name": (
+                                    f"{label.replace('.', '_')}_h{h}_sm_{i}"
+                                ),
+                                "input_ports": ["clk", "rst", "start",
+                                                 "x_packed", "mask"],
+                                "output_port": "y_packed",
+                                "extra_output_ports": [("done", done_n)],
+                            },
+                            output_width=seq * 8, output_signed=False,
+                        ))
+                        row_w = []
+                        for j in range(seq):
+                            wn = f"{label}.h{h}.w_{i}_{j}"
+                            gates.append(Gate(
+                                name=wn, kind="slice",
+                                inputs=[yp],
+                                attrs={"hi": (j + 1) * 8 - 1,
+                                       "lo": j * 8},
+                                output_width=8, output_signed=False,
+                            ))
+                            row_w.append(wn)
+                        weight_outs.append(row_w)
+
+                    head_out: list[str] = []
+                    for i in range(seq):
+                        for kv in range(d_v):
+                            prod_names = []
+                            for j in range(seq):
+                                pn = f"{label}.h{h}.outprod_{i}_{kv}_{j}"
+                                gates.append(Gate(
+                                    name=pn, kind="mul",
+                                    inputs=[weight_outs[i][j],
+                                            head_v[j * d_v + kv]],
+                                    output_width=8 + in_w,
+                                    output_signed=True,
+                                ))
+                                prod_names.append(pn)
+                            sn = f"{label}.h{h}.out_{i}_{kv}"
+                            gates.append(Gate(
+                                name=sn, kind="linear",
+                                inputs=prod_names,
+                                attrs={"weights": [1] * seq, "bias": 0},
+                                output_width=out_width, output_signed=True,
+                            ))
+                            head_out.append(sn)
+                    per_head_outputs.append(head_out)
+
+                # Concat per-head outputs into the final output signal
+                # list (head-major: head 0's outputs first, then head 1).
+                output_sigs: list[str] = []
+                for h in range(num_heads):
+                    output_sigs.extend(per_head_outputs[h])
                 val_signals[outs[0]] = output_sigs
                 val_widths[outs[0]] = out_width
                 val_signed[outs[0]] = True

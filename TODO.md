@@ -51,14 +51,7 @@ Recently shipped (not in this list):
 
 1. Build the verilator simulator binary for the 30-layer SmolLM2 module and drive a real prompt through it, capturing the predicted next token.
 2. Build verilator binaries at 2 and 4 layers and confirm each produces a plausible token for a fixed prompt.
-3. Add multi-head support to the ONNX `Attention` lowering, with optional mask plus `past_key` / `past_value`.
-4. Bit-exact iverilog test for ONNX `Softmax` against `torch.nn.functional.softmax` on a row of 8 int8 inputs.
-5. Have `--sidecar-layout subdirs` rewrite the `$readmemh` paths in the emitted Verilog to include the subdirectory prefix, so the Verilog is self-contained without manual include-path management.
-6. Have one built-in frontend (e.g., `threshold_logic` with `--circuit` selecting multiple prefixes) override `parse_multi` to return multiple graphs.
-7. Have the `embedding_block` factory call `emit_chunked_rom` when `V * H` exceeds the BRAM threshold, replacing the flat ROM path at scale.
-8. Round-trip `emit_instantiation_template` by compiling a wrapper that consumes the snippet against the original module and confirming both elaborate together.
-9. Add explicit bit-exact iverilog tests for `sigmoid_block`, `silu_block`, `exp_block`, and `softmax_block` (the older README's "bit-exact" claim predates the recent session; the new tests cover only `tanh_block`, `conv2d`, `conv_transpose2d`, the streaming matmul, the chunked ROM, and `fp8_e4m3_mul`).
-10. Run `emit_vivado_tcl` output through Vivado and check in the resulting utilization + timing reports.
-11. Run `emit_quartus_qsf` output through `quartus_sh -t` and check in the fit + STA reports.
-12. Run `emit_synopsys_dc_tcl` output through `dc_shell` and check in the area + timing reports.
-13. Cross-check `llama_int_reference_one_layer` output bit-exactly against the Verilog the `hf_llama` frontend emits (the current cross-check verifies elaboration + cycle bound; bit-exact diff requires a LUT-bit-exact Python mirror of the rsqrt / silu / softmax LUTs).
+3. Run `emit_vivado_tcl` output through Vivado and check in the resulting utilization + timing reports.
+4. Run `emit_quartus_qsf` output through `quartus_sh -t` and check in the fit + STA reports.
+5. Run `emit_synopsys_dc_tcl` output through `dc_shell` and check in the area + timing reports.
+6. Cross-check `llama_int_reference_one_layer` output bit-exactly against the Verilog the `hf_llama` frontend emits (the current cross-check verifies elaboration + cycle bound; bit-exact diff requires a LUT-bit-exact Python mirror of the rsqrt / silu / softmax LUTs).
