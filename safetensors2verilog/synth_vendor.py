@@ -157,6 +157,55 @@ def emit_quartus_qsf(
     return {".qsf": qsf, ".sdc": sdc, ".tcl": tcl}
 
 
+def validate_tcl_script(text: str) -> list[str]:
+    """Static checks on a Tcl-style synth script.
+
+    Returns a list of issue messages. An empty list means the script
+    passes the static checks. The checks are:
+      * Balanced ``{`` / ``}`` braces.
+      * Balanced ``[`` / ``]`` (for ``[get_ports ...]`` etc.).
+      * Balanced ``"`` quotes per line.
+      * No ``$`` followed by an undefined variable, where defined
+        variables come from ``set <name> ...`` lines plus a small
+        whitelist of vendor builtins.
+
+    These catch the most common errors that would otherwise crash the
+    licensed tools at runtime. They are not a substitute for actually
+    running the tool, but they keep the emitted scripts well-formed.
+    """
+    import re as _re
+    issues: list[str] = []
+    open_brace = text.count("{")
+    close_brace = text.count("}")
+    if open_brace != close_brace:
+        issues.append(
+            f"unbalanced braces: open={open_brace}, close={close_brace}"
+        )
+    open_brack = text.count("[")
+    close_brack = text.count("]")
+    if open_brack != close_brack:
+        issues.append(
+            f"unbalanced brackets: open={open_brack}, close={close_brack}"
+        )
+    for ln, line in enumerate(text.splitlines(), 1):
+        comment_idx = line.find("#")
+        line_eff = line[:comment_idx] if comment_idx >= 0 else line
+        if line_eff.count('"') % 2 != 0:
+            issues.append(f"line {ln}: unbalanced double-quotes")
+    defined = set(_re.findall(r"\bset\s+([A-Za-z_]\w*)", text))
+    builtins = {
+        "argv", "argc", "env", "tcl_platform", "auto_path",
+        "errorInfo", "errorCode", "tcl_version",
+    }
+    for ln, line in enumerate(text.splitlines(), 1):
+        comment_idx = line.find("#")
+        eff = line[:comment_idx] if comment_idx >= 0 else line
+        for use in _re.findall(r"\$\{?([A-Za-z_]\w*)", eff):
+            if use not in defined and use not in builtins:
+                issues.append(f"line {ln}: undefined variable ${use}")
+    return issues
+
+
 def emit_synopsys_dc_tcl(
     verilog_path: str | Path,
     top: str,

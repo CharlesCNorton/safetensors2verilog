@@ -163,6 +163,10 @@ class OnnxTopologyFrontend(Frontend):
         # (h, w, c) order to match the conv2d primitive's expected
         # x_packed layout. Mutate graph_inputs in place so downstream
         # iterations see the flattened shape.
+        # We also remember every non-initializer input's ORIGINAL 4-D
+        # shape in ``value_info_shapes`` so Conv / ConvTranspose can
+        # honour the explicit (H, W) instead of inferring it via sqrt.
+        value_info_shapes: dict[str, tuple[int, int, int]] = {}
         flattened: list[tuple[str, list[int]]] = []
         for in_name, in_shape in graph_inputs:
             if not in_shape:
@@ -176,6 +180,7 @@ class OnnxTopologyFrontend(Frontend):
                         f"batch=1 supported"
                     )
                 _, in_c, in_hh, in_ww = in_shape
+                value_info_shapes[in_name] = (in_c, in_hh, in_ww)
                 in_shape = [in_hh * in_ww * in_c]
             elif len(in_shape) > 2:
                 raise NotImplementedError(
@@ -823,22 +828,40 @@ class OnnxTopologyFrontend(Frontend):
                         f"{expected_in_elems} not divisible by in_c={in_c}"
                     )
                 spatial = expected_in_elems // in_c
-                in_h_guess = int(spatial ** 0.5)
-                if in_h_guess * in_h_guess == spatial:
-                    in_h_in, in_w_in = in_h_guess, in_h_guess
+                # Prefer the explicit (H, W) recorded in value_info_shapes
+                # when the input came from a 4-D NCHW graph input. Falls
+                # back to assuming a square shape when value_info doesn't
+                # have one (e.g. when the input was synthesised by an
+                # upstream node).
+                if x_name in value_info_shapes:
+                    _ic_vi, in_h_in, in_w_in = value_info_shapes[x_name]
+                    if in_h_in * in_w_in != spatial:
+                        raise ValueError(
+                            f"Conv node '{node.name}': value_info shape "
+                            f"H*W={in_h_in*in_w_in} doesn't match "
+                            f"observed spatial={spatial}"
+                        )
                 else:
-                    raise NotImplementedError(
-                        f"Conv node '{node.name}': non-square implicit "
-                        f"input ({spatial} elements / {in_c} channels). "
-                        f"Reshape to square upstream or extend the frontend "
-                        f"to read explicit (H, W) shape from value_info."
-                    )
+                    in_h_guess = int(spatial ** 0.5)
+                    if in_h_guess * in_h_guess == spatial:
+                        in_h_in, in_w_in = in_h_guess, in_h_guess
+                    else:
+                        raise NotImplementedError(
+                            f"Conv node '{node.name}': non-square implicit "
+                            f"input ({spatial} elements / {in_c} channels) "
+                            f"and no value_info shape recorded for "
+                            f"'{x_name}'. Annotate the upstream value's "
+                            f"4-D NCHW shape in the model's value_info."
+                        )
                 out_h_calc = (in_h_in + 2 * pad_h - kH) // stride_h + 1
                 out_w_calc = (in_w_in + 2 * pad_w - kW) // stride_w + 1
                 out_bits = max(in_w_bits, weight_bits) + max(
                     1, (in_c * kH * kW).bit_length()
                 ) + 1
 
+                # Record the conv output's spatial shape so a later Conv
+                # consuming this output can read it back.
+                value_info_shapes[outs[0]] = (out_c, out_h_calc, out_w_calc)
                 label = node.name or f"conv_{len(gates)}"
                 pack_name = f"{label}_x_packed"
                 gates.append(Gate(
@@ -963,15 +986,25 @@ class OnnxTopologyFrontend(Frontend):
                         f"in_c={in_c}"
                     )
                 spatial = expected_in_elems // in_c
-                in_h_guess = int(spatial ** 0.5)
-                if in_h_guess * in_h_guess == spatial:
-                    in_h_in, in_w_in = in_h_guess, in_h_guess
+                if x_name in value_info_shapes:
+                    _ic_vi, in_h_in, in_w_in = value_info_shapes[x_name]
+                    if in_h_in * in_w_in != spatial:
+                        raise ValueError(
+                            f"ConvTranspose node '{node.name}': "
+                            f"value_info H*W={in_h_in*in_w_in} != "
+                            f"observed spatial={spatial}"
+                        )
                 else:
-                    raise NotImplementedError(
-                        f"ConvTranspose node '{node.name}': non-square "
-                        f"implicit input ({spatial} elements / {in_c} "
-                        f"channels)"
-                    )
+                    in_h_guess = int(spatial ** 0.5)
+                    if in_h_guess * in_h_guess == spatial:
+                        in_h_in, in_w_in = in_h_guess, in_h_guess
+                    else:
+                        raise NotImplementedError(
+                            f"ConvTranspose node '{node.name}': non-square "
+                            f"implicit input ({spatial} elements / {in_c} "
+                            f"channels) and no value_info shape recorded "
+                            f"for '{x_name}'."
+                        )
                 out_h_calc = (in_h_in - 1) * stride_h - 2 * pad_h + kH + opad_h
                 out_w_calc = (in_w_in - 1) * stride_w - 2 * pad_w + kW + opad_w
                 if out_h_calc <= 0 or out_w_calc <= 0:
@@ -1027,6 +1060,7 @@ class OnnxTopologyFrontend(Frontend):
                 val_signals[outs[0]] = ct_out_sigs
                 val_widths[outs[0]] = out_bits
                 val_signed[outs[0]] = True
+                value_info_shapes[outs[0]] = (out_c, out_h_calc, out_w_calc)
 
             elif op == "BatchNormalization":
                 # Inference-only BatchNorm: bakes the running statistics

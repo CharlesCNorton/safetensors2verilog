@@ -725,10 +725,12 @@ def _lower_fp8_e4m3_mul(ctx: EmitContext, g: Gate) -> list[str]:
         f"{{1'b0, {name}_mb}} : {{1'b1, {name}_mb}};",
         # 4x4 -> 8-bit mantissa product.
         f"  wire [7:0]  {name}_mp    = {name}_ma1 * {name}_mb1;",
-        # Sum exponents (each biased by 7), subtract one bias.
-        # Result is an 8-bit signed exponent in [-14, +30].
+        # Sum biased exponents (each biased by 7) and subtract the bias
+        # TWICE to recover the UNBIASED product exponent:
+        # y_unbiased_exp = (ea - 7) + (eb - 7) = ea + eb - 14.
+        # Result is an 8-bit signed exponent in [-14, +16].
         f"  wire signed [7:0] {name}_es = "
-        f"$signed({{4'b0, {name}_ea}}) + $signed({{4'b0, {name}_eb}}) - 8'sd7;",
+        f"$signed({{4'b0, {name}_ea}}) + $signed({{4'b0, {name}_eb}}) - 8'sd14;",
         # Normalize: if mp[7] is set, the leading bit is at position 7
         # (product >= 2.0); shift right 1 and bump exponent. Otherwise
         # the leading bit is at position 6.

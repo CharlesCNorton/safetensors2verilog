@@ -168,6 +168,43 @@ def llama_int_reference_one_layer(
     return final.to(torch.int32)
 
 
+def rope_apply(
+    packed: torch.Tensor,
+    *,
+    n_heads: int,
+    head_dim: int,
+    position: int,
+    theta_base: float = 10000.0,
+) -> torch.Tensor:
+    """Apply RoPE to a packed [n_heads * head_dim] vector.
+
+    RoPE rotates pairs of dimensions ``(2i, 2i+1)`` of each head by an
+    angle ``position * theta_base ** (-2i / head_dim)``. Returns a new
+    fp32 tensor of the same length; the input is not mutated.
+
+    Position 0 is the identity rotation (cos=1, sin=0); position k > 0
+    rotates each dimension pair by an increasing angle. Standard LLaMA
+    convention.
+    """
+    if packed.numel() != n_heads * head_dim:
+        raise ValueError(
+            f"rope_apply: packed length {packed.numel()} != "
+            f"n_heads * head_dim = {n_heads * head_dim}"
+        )
+    out = packed.clone().to(torch.float32)
+    for h in range(n_heads):
+        base = h * head_dim
+        for i in range(head_dim // 2):
+            inv_freq = theta_base ** (-2.0 * i / head_dim)
+            ang = position * inv_freq
+            ca, sa = math.cos(ang), math.sin(ang)
+            x0 = float(out[base + 2 * i])
+            x1 = float(out[base + 2 * i + 1])
+            out[base + 2 * i] = x0 * ca - x1 * sa
+            out[base + 2 * i + 1] = x0 * sa + x1 * ca
+    return out
+
+
 def llama_fp32_reference_logits_one_layer(
     *,
     config: dict,
@@ -215,12 +252,15 @@ def llama_fp32_reference_logits_one_layer(
         rms_val = torch.sqrt((x * x).mean() + EPS)
         return (x / rms_val) * gamma
 
+    ROPE_THETA = float(config.get("rope_theta", 10000.0))
     norm1 = rms(hidden, g1)
     q = Wq @ norm1
     k = Wk @ norm1
     v = Wv @ norm1
-    # RoPE at position p over (q, k) head-by-head; for the first-token
-    # case position=0 makes RoPE the identity, so we skip it.
+    q = rope_apply(q, n_heads=H, head_dim=D, position=position,
+                   theta_base=ROPE_THETA)
+    k = rope_apply(k, n_heads=KV, head_dim=D, position=position,
+                   theta_base=ROPE_THETA)
     # First-token attention against single K/V repeats V across head groups.
     attn_out = (
         v.view(KV, D)

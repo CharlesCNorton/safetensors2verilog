@@ -59,6 +59,7 @@ def evaluate_graph(
     inputs: dict[str, int],
     *,
     register_state: dict[str, int] | None = None,
+    ram_state: dict[str, list[int]] | None = None,
 ) -> dict[str, int | None]:
     """Evaluate every signal in `graph` given external `inputs`.
 
@@ -70,9 +71,15 @@ def evaluate_graph(
     as a {register_name: previous_value} dict. Registers' outputs come
     from the state; their D inputs are not evaluated by this function
     (use `step_graph` to advance state).
+
+    For graphs that contain `ram_writable` gates, supply ``ram_state`` as
+    a ``{ram_name: list[int]}`` dict; reads return ``ram_state[name][read_addr]``
+    when present, falling back to the gate's ``attrs.init``. Use
+    ``step_graph`` to advance writes per cycle.
     """
     widths, signed, gate_by_name = _build_signal_info(graph)
     register_state = register_state or {}
+    ram_state = ram_state or {}
 
     # ``int | None`` because tristate gates return None for high-Z; the
     # value is otherwise an integer.
@@ -103,7 +110,21 @@ def evaluate_graph(
         if g.kind == "register":
             continue
         try:
-            v = _eval_gate(g, values, widths, signed)
+            if g.kind == "ram_writable" and g.name in ram_state:
+                # Read from the live state, not the init contents.
+                inps_for_ram = [values[s] for s in g.inputs]
+                read_addr = inps_for_ram[0]
+                if read_addr is None:
+                    v = None
+                else:
+                    bank = ram_state[g.name]
+                    depth = int(g.attrs["depth"])
+                    if 0 <= int(read_addr) < depth:
+                        v = bank[int(read_addr)] if int(read_addr) < len(bank) else 0
+                    else:
+                        v = 0
+            else:
+                v = _eval_gate(g, values, widths, signed)
         except KeyError as e:
             raise ValueError(
                 f"gate '{g.name}' references undefined signal {e}"
@@ -122,16 +143,59 @@ def step_graph(
     graph: GateGraph,
     inputs: dict[str, int],
     register_state: dict[str, int],
-) -> dict[str, int]:
+    ram_state: dict[str, list[int]] | None = None,
+) -> dict[str, int] | tuple[dict[str, int], dict[str, list[int]]]:
     """One simulation cycle: returns the next register state.
 
     Combines `evaluate_graph` with sampling each register's D input.
     The returned dict can be fed back as `register_state` for the next
     cycle.
+
+    For graphs with ``ram_writable`` gates, supply ``ram_state`` and the
+    return becomes ``(next_register_state, next_ram_state)`` so the
+    caller can feed both back next cycle. When ``ram_state`` is None the
+    legacy single-dict return is preserved.
     """
-    values = evaluate_graph(graph, inputs, register_state=register_state)
+    ram_state_was_none = ram_state is None
+    ram_state = ram_state or {}
+    values = evaluate_graph(
+        graph, inputs, register_state=register_state, ram_state=ram_state,
+    )
     next_state: dict[str, int] = {}
+    next_ram: dict[str, list[int]] = {
+        name: list(bank) for name, bank in ram_state.items()
+    }
     widths, signed, _ = _build_signal_info(graph)
+    # Apply RAM writes for this cycle.
+    for g in graph.gates:
+        if g.kind != "ram_writable":
+            continue
+        if len(g.inputs) != 4:
+            continue
+        write_addr_v = values.get(g.inputs[1])
+        write_data_v = values.get(g.inputs[2])
+        write_en_v = values.get(g.inputs[3])
+        if write_en_v is None or not int(write_en_v):
+            # Initialise the bank from init contents on first use.
+            if g.name not in next_ram:
+                init = list(g.attrs.get("init", []))
+                depth = int(g.attrs["depth"])
+                bank = init + [0] * max(0, depth - len(init))
+                next_ram[g.name] = bank[:depth]
+            continue
+        if g.name not in next_ram:
+            init = list(g.attrs.get("init", []))
+            depth = int(g.attrs["depth"])
+            bank = init + [0] * max(0, depth - len(init))
+            next_ram[g.name] = bank[:depth]
+        if write_addr_v is None or write_data_v is None:
+            continue
+        depth = int(g.attrs["depth"])
+        addr = int(write_addr_v)
+        if 0 <= addr < depth:
+            width = int(g.attrs["width"])
+            mask = (1 << width) - 1
+            next_ram[g.name][addr] = int(write_data_v) & mask
     for g in graph.gates:
         if g.kind != "register":
             continue
@@ -151,7 +215,9 @@ def step_graph(
                 next_state[g.name] = _mask(
                     d_val, widths[g.name], signed[g.name]
                 )
-    return next_state
+    if ram_state_was_none:
+        return next_state
+    return next_state, next_ram
 
 
 def _eval_gate(

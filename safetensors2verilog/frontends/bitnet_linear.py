@@ -323,11 +323,16 @@ def _build_sequential(
         add("from_compute_target", "mux",
             inputs=["eff_finishing", "const.state.compute", "const.state.done"],
             output_width=state_w)
-        # priority: is_done > is_compute > is_fill > else (idle)
+        # mux on state.curr with state encoding IDLE=0, COMPUTE=1, DONE=2,
+        # FILL=3. The DONE slot is don't-care because the outer state.next
+        # mux overrides it (DONE -> IDLE unconditionally without handshake,
+        # or via handshake gating with it).
         add("state_next_no_done", "mux",
-            inputs=["state.curr", "from_idle_target",
-                    "from_compute_target", "from_fill_target",
-                    "from_idle_target"],
+            inputs=["state.curr",
+                    "from_idle_target",      # state=0 (IDLE)
+                    "from_compute_target",   # state=1 (COMPUTE)
+                    "const.state.idle",      # state=2 (DONE; overridden)
+                    "from_fill_target"],     # state=3 (FILL)
             output_width=state_w)
     else:
         add("from_compute_target", "mux",
