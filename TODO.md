@@ -47,8 +47,3 @@ Recently shipped (not in this list):
 - `mypy --strict` per-module overrides on `core` / `analysis` / `transforms` / `synth` / `evaluate`.
 - `yosys_calibrated_estimate` wrapper in `examples/lut_ff_estimate.py`.
 - 236 unit tests pass; bit-exact iverilog coverage on tanh, conv2d, conv_transpose2d, chunked ROM, fp8 mul, real-world bitnet fixture, and the sequential-bitnet variant combinations including mac_sharing.
-
-## Open
-
-Empty. Future work lives in commits and on `git log`. Open a PR with a
-self-contained module + tests if you want to extend the project.
