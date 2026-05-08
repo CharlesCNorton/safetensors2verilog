@@ -546,6 +546,84 @@ def calibrate_iteratively(
     return stats, params
 
 
+def calibrate_iteratively_damped(
+    *,
+    config: dict,
+    state_dict: dict[str, torch.Tensor],
+    token_sequences: list[list[int]],
+    abits: int = 8,
+    weight_bits: int = 8,
+    n_iterations: int = 5,
+    target_max: int = 80,
+    mul_bits: int = 8,
+    use_p995: bool = False,
+    damping: float = 0.5,
+    n_layers_override: int | None = None,
+) -> tuple[LlamaCalibration, list[dict[str, dict[str, list[int]]]]]:
+    """Damped variant of ``calibrate_iteratively`` that interpolates each
+    iteration's raw derived (mul, shift) against the previous iteration's
+    values, smoothing the cross-site oscillation that the undamped form
+    exhibits on full-scale models like SmolLM2.
+
+    Damping rule per channel per site::
+
+        new_mul   = round(damping * raw_mul   + (1 - damping) * old_mul)
+        new_shift = round(damping * raw_shift + (1 - damping) * old_shift)
+
+    With ``damping=1.0`` this reduces to the undamped iteration. With
+    ``damping<1`` the iteration approaches the fixed point gradually,
+    avoiding the o-site overshoot / norm-saturation cascade that
+    overshooting causes on residual-amplified architectures.
+
+    Returns (final stats, final params).
+    """
+    if not 0.0 < damping <= 1.0:
+        raise ValueError(
+            f"damping must be in (0, 1], got {damping}"
+        )
+    params: list[dict[str, dict[str, list[int]]]] | None = None
+    stats: LlamaCalibration | None = None
+    for _ in range(max(1, n_iterations)):
+        stats = collect_activation_stats(
+            config=config, state_dict=state_dict,
+            token_sequences=token_sequences,
+            abits=abits, weight_bits=weight_bits,
+            n_layers_override=n_layers_override,
+            prev_params=params,
+        )
+        raw_params = derive_requantize_params(
+            stats, target_max=target_max, mul_bits=mul_bits,
+            use_p995=use_p995,
+        )
+        if params is None:
+            params = raw_params
+        else:
+            blended: list[dict[str, dict[str, list[int]]]] = []
+            for layer_old, layer_raw in zip(params, raw_params):
+                layer_b: dict[str, dict[str, list[int]]] = {}
+                for site in REQUANTIZE_SITES:
+                    old = layer_old.get(site)
+                    raw = layer_raw.get(site)
+                    if old is None or raw is None:
+                        layer_b[site] = raw if raw is not None else old
+                        continue
+                    new_muls = [
+                        round(damping * raw_m + (1 - damping) * old_m)
+                        for raw_m, old_m in zip(raw["muls"], old["muls"])
+                    ]
+                    new_shifts = [
+                        round(damping * raw_s + (1 - damping) * old_s)
+                        for raw_s, old_s in zip(raw["shifts"], old["shifts"])
+                    ]
+                    layer_b[site] = {
+                        "muls": new_muls, "shifts": new_shifts,
+                    }
+                blended.append(layer_b)
+            params = blended
+    assert stats is not None and params is not None
+    return stats, params
+
+
 def saturation_summary(
     params: list[dict[str, dict[str, list[int]]]],
     stats: LlamaCalibration,

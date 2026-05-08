@@ -143,9 +143,10 @@ def test_onnx_topology_safetensors_overrides_onnx_weights():
 
 
 def test_onnx_topology_unsupported_op_raises():
-    """An unsupported op (ConvTranspose) raises NotImplementedError naming
-    the op. BatchNormalization, LayerNormalization, GroupNormalization,
-    Conv, Attention, and Softmax are all now supported."""
+    """A genuinely unsupported op (Cast: no dedicated handler) raises
+    NotImplementedError. Conv, ConvTranspose, BatchNormalization,
+    LayerNormalization, GroupNormalization, Attention, and Softmax are
+    all now supported."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         onnx_path = td / "model.onnx"
@@ -153,16 +154,11 @@ def test_onnx_topology_unsupported_op_raises():
 
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        # ConvTranspose is the canonical "still unsupported" op.
-        w = numpy_helper.from_array(
-            torch.zeros(4, 4, 1, 1, dtype=torch.float32).numpy(),
-            name="ct_w",
-        )
         node = helper.make_node(
-            "ConvTranspose", ["x", "ct_w"], ["y"], "convt1",
-            kernel_shape=[1, 1],
+            "Cast", ["x"], ["y"], "cast1",
+            to=int(TensorProto.INT32),
         )
-        graph = helper.make_graph([node], "g", [x], [y], [w])
+        graph = helper.make_graph([node], "g", [x], [y], [])
         model = helper.make_model(
             graph, opset_imports=[helper.make_opsetid("", 17)]
         )
@@ -170,7 +166,7 @@ def test_onnx_topology_unsupported_op_raises():
 
         save_file({"_unused": torch.tensor([0], dtype=torch.int8)}, str(st_path))
 
-        with pytest.raises(NotImplementedError, match="ConvTranspose"):
+        with pytest.raises(NotImplementedError, match="Cast"):
             registry.get("onnx_topology")().parse(st_path, onnx=str(onnx_path))
 
 
@@ -354,18 +350,14 @@ def test_onnx_topology_unsupported_op_lists_alternatives():
         sp = td / "w.safetensors"
         x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
         y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-        # ConvTranspose stays in the deferred list (transposed convolution
-        # isn't lowered through the conv2d primitive yet); use it as the
-        # canonical "still unsupported" op for this test.
-        w_init = numpy_helper.from_array(
-            torch.zeros(4, 4, 1, 1, dtype=torch.float32).numpy(),
-            name="conv_w",
-        )
+        # Cast is a real ONNX op without a dedicated handler; it falls
+        # through to the generic "unsupported op" branch which lists
+        # supported / deferred ops. Conv, ConvTranspose, BatchNorm,
+        # GroupNorm, Attention, and Softmax are all now wired through.
         node = helper.make_node(
-            "ConvTranspose", ["x", "conv_w"], ["y"], "convt1",
-            kernel_shape=[1, 1],
+            "Cast", ["x"], ["y"], "cast1", to=int(TensorProto.INT32),
         )
-        graph = helper.make_graph([node], "g", [x], [y], [w_init])
+        graph = helper.make_graph([node], "g", [x], [y], [])
         model = helper.make_model(
             graph, opset_imports=[helper.make_opsetid("", 13)]
         )
@@ -374,7 +366,8 @@ def test_onnx_topology_unsupported_op_lists_alternatives():
         with pytest.raises(NotImplementedError) as exc:
             registry.get("onnx_topology")().parse(sp, onnx=str(op))
         msg = str(exc.value)
-        assert "ConvTranspose" in msg
+        assert "Cast" in msg
+        assert "Supported:" in msg or "Conv" in msg
 
 
 def _have_iverilog() -> bool:

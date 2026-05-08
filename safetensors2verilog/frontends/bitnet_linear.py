@@ -107,6 +107,7 @@ def _build_sequential(
     streaming_input: bool = False,
     handshake: bool = False,
     weight_bram: bool = False,
+    mac_sharing: bool = False,
 ) -> GateGraph:
     """Build a streaming-MAC architecture for chained ternary linear layers.
 
@@ -487,6 +488,12 @@ def _build_sequential(
     # Layer 0 reads from external x[0..N0-1] (or in_buf when streaming_input).
     # Layer L>0 reads from previous layer's accumulators.
     # Each layer's input mux picks 1 input based on counter.
+    # When mac_sharing is on, layer L+1 reads from L's storage register
+    # file instead of the per-output accumulators. The acc registers
+    # still exist and update each cycle; storage captures at end-of-group
+    # so downstream layers see stable values.
+    acc_signal_template = "L{L}.store{j}.curr" if mac_sharing else "L{L}.acc{j}.curr"
+
     for L in range(K):
         if L == 0:
             if streaming_input:
@@ -494,7 +501,10 @@ def _build_sequential(
             else:
                 sources = [f"x{i}" for i in range(in_sizes[0])]
         else:
-            sources = [f"L{L-1}.acc{j}.curr" for j in range(out_sizes[L-1])]
+            sources = [
+                acc_signal_template.format(L=L - 1, j=j)
+                for j in range(out_sizes[L - 1])
+            ]
         # Pad sources to power-of-2 size for clean mux indexing? Not needed:
         # the mux walks counter; values beyond in_sizes[L]-1 won't be read
         # because counter never reaches them.
@@ -643,26 +653,59 @@ def _build_sequential(
                 attrs={"clk": "clk", "rst": "rst", "init": 0},
                 output_width=mac_widths[L], output_signed=True)
 
+            # ---- mac_sharing storage register --------------------------
+            # Captures the accumulator value at end-of-group for output j,
+            # signaling to the synth tool's resource-sharing pass that
+            # the accumulator is consumed only at the group boundary.
+            # Combined with --parallelism's group gating, this gives the
+            # architectural pattern where N MAC units feed an out_size
+            # storage file. The accumulator values can then be reused
+            # across groups in physical hardware.
+            if mac_sharing:
+                if use_parallelism:
+                    # Capture only when this output's group is current.
+                    add(f"L{L}.store_capture{j}", "and",
+                        inputs=[f"L{L}.is_active{j}", "is_last_input"])
+                else:
+                    # Without parallelism, capture at every is_last_input
+                    # within this layer.
+                    add(f"L{L}.store_capture{j}", "and",
+                        inputs=["compute_and_last_input", f"is_layer.{L}"])
+                add(f"L{L}.store{j}.next", "mux",
+                    inputs=[
+                        f"L{L}.store_capture{j}",
+                        f"L{L}.store{j}.curr",
+                        f"L{L}.acc{j}.next",
+                    ],
+                    output_width=mac_widths[L], output_signed=True)
+                add(f"L{L}.store{j}.curr", "register",
+                    inputs=[f"L{L}.store{j}.next"],
+                    attrs={"clk": "clk", "rst": "rst", "init": 0},
+                    output_width=mac_widths[L], output_signed=True)
+
     # ---- Optional output clamp -----------------------------------------
     final_L = K - 1
     final_mac_width = mac_widths[final_L]
     final_outputs: list[str] = []
+    final_acc_template = (
+        "L{L}.store{j}.curr" if mac_sharing else "L{L}.acc{j}.curr"
+    )
     if clamp_range is not None:
         lo, hi = clamp_range
         for j in range(out_sizes[final_L]):
             add(f"y{j}", "clamp",
-                inputs=[f"L{final_L}.acc{j}.curr"],
+                inputs=[final_acc_template.format(L=final_L, j=j)],
                 attrs={"lo": lo, "hi": hi},
                 output_width=final_mac_width, output_signed=True)
             final_outputs.append(f"y{j}")
     else:
-        # Buffer the accumulators to a public 'y<j>' name via a +0.
         for j in range(out_sizes[final_L]):
             add(f"y{j}.zero", "constant",
                 attrs={"value": 0},
                 output_width=final_mac_width, output_signed=True)
             add(f"y{j}", "add",
-                inputs=[f"L{final_L}.acc{j}.curr", f"y{j}.zero"],
+                inputs=[final_acc_template.format(L=final_L, j=j),
+                        f"y{j}.zero"],
                 output_width=final_mac_width, output_signed=True)
             final_outputs.append(f"y{j}")
 
@@ -810,6 +853,21 @@ class BitNetLinearFrontend(Frontend):
                     "layer's accumulator width."
                 ),
             ),
+            FrontendOption(
+                name="mac-sharing",
+                type=bool,
+                default=False,
+                help=(
+                    "sequential-mode --mac-sharing: emit per-output "
+                    "storage registers that capture the accumulator "
+                    "value at end-of-group, with inter-layer reads + "
+                    "final outputs going through storage. Combined with "
+                    "--parallelism N this gives the synth tool the "
+                    "structural cues (active accumulators feeding storage "
+                    "captured at group boundaries) to share MAC hardware "
+                    "across output groups in the placed design."
+                ),
+            ),
         ]
 
     def parse(
@@ -825,6 +883,7 @@ class BitNetLinearFrontend(Frontend):
         streaming_input: bool = False,
         handshake: bool = False,
         weight_bram: bool = False,
+        mac_sharing: bool = False,
         **options,
     ) -> GateGraph:
         if pipeline and sequential:
@@ -839,11 +898,11 @@ class BitNetLinearFrontend(Frontend):
             raise ValueError(
                 f"--parallelism must be non-negative, got {parallelism}"
             )
-        if (parallelism or streaming_input or handshake or weight_bram) \
+        if (parallelism or streaming_input or handshake or weight_bram or mac_sharing) \
                 and not sequential:
             raise ValueError(
                 "--parallelism / --streaming-input / --handshake / "
-                "--weight-bram only apply with --sequential."
+                "--weight-bram / --mac-sharing only apply with --sequential."
             )
 
         clamp_range = _parse_clamp_arg(output_clamp)
@@ -900,6 +959,7 @@ class BitNetLinearFrontend(Frontend):
                 streaming_input=streaming_input,
                 handshake=handshake,
                 weight_bram=weight_bram,
+                mac_sharing=mac_sharing,
             )
 
         gates: list[Gate] = []

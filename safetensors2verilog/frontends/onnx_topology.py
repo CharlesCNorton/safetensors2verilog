@@ -883,12 +883,150 @@ class OnnxTopologyFrontend(Frontend):
                 val_signed[outs[0]] = True
 
             elif op == "ConvTranspose":
-                raise NotImplementedError(
-                    f"ConvTranspose node '{node.name}': transposed "
-                    f"convolution is not yet wired through the conv2d "
-                    f"primitive. Workaround: replace ConvTranspose with "
-                    f"the equivalent forward Conv plus an upsample."
-                )
+                # ONNX ConvTranspose (NCHW): X is [batch, in_c, in_h, in_w];
+                # W is [in_c, out_c/groups, kH, kW] (transposed convention).
+                attrs = {a.name: a for a in node.attribute}
+                kernel_shape = list(attrs["kernel_shape"].ints) if "kernel_shape" in attrs else None
+                strides = list(attrs["strides"].ints) if "strides" in attrs else [1, 1]
+                pads = list(attrs["pads"].ints) if "pads" in attrs else [0, 0, 0, 0]
+                output_padding = list(attrs["output_padding"].ints) if "output_padding" in attrs else [0, 0]
+                dilations = list(attrs["dilations"].ints) if "dilations" in attrs else [1, 1]
+                groups = int(attrs["group"].i) if "group" in attrs else 1
+                if dilations != [1, 1]:
+                    raise NotImplementedError(
+                        f"ConvTranspose node '{node.name}': dilations "
+                        f"{dilations} != [1, 1] not supported"
+                    )
+                if groups != 1:
+                    raise NotImplementedError(
+                        f"ConvTranspose node '{node.name}': group="
+                        f"{groups}; only group=1 supported"
+                    )
+                if pads[0] != pads[2] or pads[1] != pads[3]:
+                    raise NotImplementedError(
+                        f"ConvTranspose node '{node.name}': asymmetric "
+                        f"pads {pads}"
+                    )
+                pad_h, pad_w = int(pads[0]), int(pads[1])
+                stride_h, stride_w = int(strides[0]), int(strides[1])
+                opad_h = int(output_padding[0])
+                opad_w = int(output_padding[1])
+
+                W_name = ins[1]
+                if W_name not in initializers:
+                    raise NotImplementedError(
+                        f"ConvTranspose node '{node.name}': weight "
+                        f"'{W_name}' must be an initializer"
+                    )
+                W = initializers[W_name]
+                if W.dim() != 4:
+                    raise ValueError(
+                        f"ConvTranspose node '{node.name}': weight is "
+                        f"not 4-D"
+                    )
+                in_c, out_c, kH, kW = W.shape
+                if kernel_shape is not None and kernel_shape != [kH, kW]:
+                    raise ValueError(
+                        f"ConvTranspose node '{node.name}': kernel_shape "
+                        f"attr {kernel_shape} != weight ({kH}, {kW})"
+                    )
+                if not _is_integer_tensor(W):
+                    raise ValueError(
+                        f"ConvTranspose node '{node.name}': weights are "
+                        f"not integer-valued"
+                    )
+                weights_lol = [
+                    [[[int(round(float(W[ic_, oc_, ki, kj]))) for kj in range(kW)]
+                      for ki in range(kH)]
+                     for oc_ in range(out_c)]
+                    for ic_ in range(in_c)
+                ]
+                biases_l: list[int] = [0] * out_c
+                if len(ins) >= 3 and ins[2] in initializers:
+                    B = initializers[ins[2]]
+                    if B.numel() != out_c:
+                        raise ValueError(
+                            f"ConvTranspose node '{node.name}': bias "
+                            f"length {B.numel()} != out_c {out_c}"
+                        )
+                    biases_l = [int(round(float(v)))
+                                for v in B.flatten().tolist()]
+
+                x_name = ins[0]
+                x_sigs = val_signals[x_name]
+                in_w_bits = val_widths[x_name]
+                expected_in_elems = len(x_sigs)
+                if expected_in_elems % in_c != 0:
+                    raise ValueError(
+                        f"ConvTranspose node '{node.name}': input element "
+                        f"count {expected_in_elems} not divisible by "
+                        f"in_c={in_c}"
+                    )
+                spatial = expected_in_elems // in_c
+                in_h_guess = int(spatial ** 0.5)
+                if in_h_guess * in_h_guess == spatial:
+                    in_h_in, in_w_in = in_h_guess, in_h_guess
+                else:
+                    raise NotImplementedError(
+                        f"ConvTranspose node '{node.name}': non-square "
+                        f"implicit input ({spatial} elements / {in_c} "
+                        f"channels)"
+                    )
+                out_h_calc = (in_h_in - 1) * stride_h - 2 * pad_h + kH + opad_h
+                out_w_calc = (in_w_in - 1) * stride_w - 2 * pad_w + kW + opad_w
+                if out_h_calc <= 0 or out_w_calc <= 0:
+                    raise ValueError(
+                        f"ConvTranspose node '{node.name}': computed "
+                        f"out=({out_h_calc},{out_w_calc}) is not positive"
+                    )
+                out_bits = max(in_w_bits, weight_bits) + max(
+                    1, (in_c * kH * kW).bit_length()
+                ) + 1
+
+                label = node.name or f"convt_{len(gates)}"
+                pack_name = f"{label}_x_packed"
+                gates.append(Gate(
+                    name=pack_name, kind="concat",
+                    inputs=list(reversed(x_sigs)),
+                    output_width=expected_in_elems * in_w_bits,
+                    output_signed=False,
+                ))
+                ct_name = f"{label}_y_packed"
+                gates.append(Gate(
+                    name=ct_name, kind="conv_transpose2d",
+                    inputs=[pack_name],
+                    attrs={
+                        "in_h": in_h_in, "in_w": in_w_in, "in_c": in_c,
+                        "out_h": out_h_calc, "out_w": out_w_calc,
+                        "out_c": out_c,
+                        "kH": kH, "kW": kW,
+                        "stride_h": stride_h, "stride_w": stride_w,
+                        "pad_h": pad_h, "pad_w": pad_w,
+                        "output_padding_h": opad_h,
+                        "output_padding_w": opad_w,
+                        "weights": weights_lol,
+                        "biases": biases_l,
+                        "act_bits": in_w_bits,
+                        "weight_bits": weight_bits,
+                        "out_bits": out_bits,
+                    },
+                    output_width=out_h_calc * out_w_calc * out_c * out_bits,
+                    output_signed=True,
+                ))
+                ct_out_sigs = []
+                for k in range(out_h_calc * out_w_calc * out_c):
+                    sn = f"{label}.{k}"
+                    gates.append(Gate(
+                        name=sn, kind="slice",
+                        inputs=[ct_name],
+                        attrs={"hi": (k + 1) * out_bits - 1,
+                               "lo": k * out_bits},
+                        output_width=out_bits, output_signed=True,
+                    ))
+                    ct_out_sigs.append(sn)
+                val_signals[outs[0]] = ct_out_sigs
+                val_widths[outs[0]] = out_bits
+                val_signed[outs[0]] = True
 
             elif op == "BatchNormalization":
                 # Inference-only BatchNorm: bakes the running statistics
@@ -1245,15 +1383,17 @@ class OnnxTopologyFrontend(Frontend):
 
             else:
                 supported = (
-                    "Gemm, MatMul, Conv, Attention (single-head, no mask), "
+                    "Gemm, MatMul, Conv, ConvTranspose, "
+                    "Attention (single-head, no mask), "
                     "BatchNormalization (inference, baked stats), "
                     "GroupNormalization, Add, Sub, Mul, Relu, Sigmoid, "
                     "Exp, Tanh, Softmax, Identity, Constant, Reshape, "
                     "Concat, Split, Gather, LayerNormalization"
                 )
                 deferred = (
-                    "ConvTranspose (transposed convolution; the conv2d "
-                    "IR primitive handles forward conv only)"
+                    "(no ONNX ops are currently in the deferred list; "
+                    "extend coverage by adding a branch to "
+                    "onnx_topology.py and a backend lowering in verilog.py)"
                 )
                 raise NotImplementedError(
                     f"ONNX op '{op}' (node '{node.name}') not supported by "

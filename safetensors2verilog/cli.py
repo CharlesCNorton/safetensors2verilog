@@ -524,6 +524,43 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--emit-vivado-tcl", type=Path, default=None, metavar="PATH",
+        help=(
+            "alongside the main output, write a Vivado batch-mode Tcl "
+            "script that runs synth_design + place_design + route_design "
+            "and emits utilization + timing reports. Use --vivado-part to "
+            "specify the FPGA device."
+        ),
+    )
+    parser.add_argument(
+        "--vivado-part", type=str, default="xcvu9p-flga2104-2L-e",
+        help="Vivado part for --emit-vivado-tcl (default: xcvu9p-flga2104-2L-e).",
+    )
+    parser.add_argument(
+        "--emit-quartus", type=Path, default=None, metavar="PATH_PREFIX",
+        help=(
+            "alongside the main output, write Quartus QSF + SDC + TCL "
+            "files at <PATH_PREFIX>.qsf / .sdc / _flow.tcl driving a "
+            "full quartus_sh -t synth + place + route flow."
+        ),
+    )
+    parser.add_argument(
+        "--quartus-part", type=str, default="1SG280HU2F50E2VG",
+        help="Quartus device (default: 1SG280HU2F50E2VG, Stratix 10).",
+    )
+    parser.add_argument(
+        "--emit-synopsys-dc-tcl", type=Path, default=None, metavar="PATH",
+        help=(
+            "alongside the main output, write a Synopsys Design Compiler "
+            "Tcl script that runs compile_ultra and emits area + timing "
+            "reports."
+        ),
+    )
+    parser.add_argument(
+        "--synopsys-library", type=str, default="slow_typical_corner.db",
+        help="Synopsys technology library for --emit-synopsys-dc-tcl.",
+    )
+    parser.add_argument(
         "--emit-multi", type=Path, default=None, metavar="DIR",
         help=(
             "use Frontend.parse_multi to enumerate every top module the "
@@ -819,6 +856,51 @@ def main(argv: list[str] | None = None) -> int:
         _info(
             f"wrote {args.emit_instantiation} (instantiation template "
             f"for {graph.top})"
+        )
+
+    if args.emit_vivado_tcl is not None and args.output is not None:
+        from .synth_vendor import emit_vivado_tcl
+        tcl = emit_vivado_tcl(
+            args.output, top=graph.top, part=args.vivado_part,
+            period_ns=args.sdc_period_ns,
+        )
+        args.emit_vivado_tcl.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_vivado_tcl.write_text(tcl, encoding="utf-8")
+        _info(
+            f"wrote {args.emit_vivado_tcl} (Vivado batch Tcl, "
+            f"part={args.vivado_part})"
+        )
+
+    if args.emit_quartus is not None and args.output is not None:
+        from .synth_vendor import emit_quartus_qsf
+        bundle = emit_quartus_qsf(
+            args.output, top=graph.top, part=args.quartus_part,
+            period_ns=args.sdc_period_ns,
+        )
+        prefix = args.emit_quartus
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        prefix.with_suffix(".qsf").write_text(
+            bundle[".qsf"], encoding="utf-8")
+        prefix.with_suffix(".sdc").write_text(
+            bundle[".sdc"], encoding="utf-8")
+        prefix.with_suffix(".tcl").write_text(
+            bundle[".tcl"], encoding="utf-8")
+        _info(
+            f"wrote {prefix.with_suffix('.qsf')} / .sdc / .tcl "
+            f"(Quartus full flow, part={args.quartus_part})"
+        )
+
+    if args.emit_synopsys_dc_tcl is not None and args.output is not None:
+        from .synth_vendor import emit_synopsys_dc_tcl
+        tcl = emit_synopsys_dc_tcl(
+            args.output, top=graph.top, library=args.synopsys_library,
+            period_ns=args.sdc_period_ns,
+        )
+        args.emit_synopsys_dc_tcl.parent.mkdir(parents=True, exist_ok=True)
+        args.emit_synopsys_dc_tcl.write_text(tcl, encoding="utf-8")
+        _info(
+            f"wrote {args.emit_synopsys_dc_tcl} (Synopsys DC Tcl, "
+            f"library={args.synopsys_library})"
         )
 
     if args.equiv_check:

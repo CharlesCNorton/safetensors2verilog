@@ -866,6 +866,113 @@ def _lower_conv2d(ctx: EmitContext, g: Gate) -> list[str]:
     return lines
 
 
+@lowering("conv_transpose2d")
+def _lower_conv_transpose2d(ctx: EmitContext, g: Gate) -> list[str]:
+    """2-D transposed convolution (a.k.a. fractionally-strided conv).
+
+    inputs : [x_packed]
+    attrs:
+      in_h, in_w, in_c, out_h, out_w, out_c, kH, kW, stride_h, stride_w,
+      pad_h, pad_w, output_padding_h, output_padding_w
+      weights : [in_c][out_c][kH][kW] integer kernel
+      biases  : optional per-output-channel
+      act_bits, weight_bits, out_bits
+
+    Each input pixel (ih, iw, ic) contributes to a kHxkW window in the
+    output at positions (ih*stride_h + ki - pad_h, iw*stride_w + kj -
+    pad_w), weighted by W[ic, oc, ki, kj]. The output is the sum of all
+    contributions plus per-channel bias.
+    """
+    if len(g.inputs) != 1:
+        raise ValueError(
+            f"gate '{g.name}' kind 'conv_transpose2d' expects 1 input"
+        )
+    a = g.attrs
+    in_h = int(a["in_h"]); in_w = int(a["in_w"]); in_c = int(a["in_c"])
+    out_h = int(a["out_h"]); out_w = int(a["out_w"]); out_c = int(a["out_c"])
+    kH = int(a["kH"]); kW = int(a["kW"])
+    stride_h = int(a.get("stride_h", 1))
+    stride_w = int(a.get("stride_w", 1))
+    pad_h = int(a.get("pad_h", 0))
+    pad_w = int(a.get("pad_w", 0))
+    output_padding_h = int(a.get("output_padding_h", 0))
+    output_padding_w = int(a.get("output_padding_w", 0))
+    act_bits = int(a["act_bits"])
+    out_bits = int(a["out_bits"])
+    weights = a["weights"]
+    biases = a.get("biases") or [0] * out_c
+
+    if len(weights) != in_c or len(weights[0]) != out_c:
+        raise ValueError(
+            f"gate '{g.name}' conv_transpose2d: weights shape "
+            f"({len(weights)},{len(weights[0])}) != ({in_c},{out_c}) "
+            f"(expected [in_c][out_c][kH][kW])"
+        )
+    expected_out_h = (in_h - 1) * stride_h - 2 * pad_h + kH + output_padding_h
+    expected_out_w = (in_w - 1) * stride_w - 2 * pad_w + kW + output_padding_w
+    if expected_out_h != out_h or expected_out_w != out_w:
+        raise ValueError(
+            f"gate '{g.name}' conv_transpose2d: declared "
+            f"out=({out_h},{out_w}) doesn't match computed "
+            f"out=({expected_out_h},{expected_out_w})"
+        )
+
+    x = ctx.name(g.inputs[0])
+    name = ctx.name(g.name)
+    output_terms: list[list[list[list[str]]]] = [
+        [[[] for _ in range(out_c)] for _ in range(out_w)]
+        for _ in range(out_h)
+    ]
+    for ih in range(in_h):
+        for iw in range(in_w):
+            for ic in range(in_c):
+                in_idx = (ih * in_w + iw) * in_c + ic
+                lo_b = in_idx * act_bits
+                hi_b = lo_b + act_bits - 1
+                xelem = f"$signed({x}[{hi_b}:{lo_b}])"
+                for ki in range(kH):
+                    oh = ih * stride_h - pad_h + ki
+                    if not 0 <= oh < out_h:
+                        continue
+                    for kj in range(kW):
+                        ow = iw * stride_w - pad_w + kj
+                        if not 0 <= ow < out_w:
+                            continue
+                        for oc in range(out_c):
+                            wgt = int(weights[ic][oc][ki][kj])
+                            if wgt == 0:
+                                continue
+                            if wgt == 1:
+                                output_terms[oh][ow][oc].append(xelem)
+                            elif wgt == -1:
+                                output_terms[oh][ow][oc].append(f"-{xelem}")
+                            else:
+                                output_terms[oh][ow][oc].append(
+                                    f"({wgt} * {xelem})"
+                                )
+    lines: list[str] = []
+    for oh in range(out_h):
+        for ow in range(out_w):
+            for oc in range(out_c):
+                terms = list(output_terms[oh][ow][oc])
+                bias_val = int(biases[oc])
+                if bias_val:
+                    terms.append(str(bias_val))
+                if not terms:
+                    terms.append("0")
+                out_idx = (oh * out_w + ow) * out_c + oc
+                lo_b = out_idx * out_bits
+                hi_b = lo_b + out_bits - 1
+                lines.append(
+                    f"  assign {name}[{hi_b}:{lo_b}] = "
+                    + " + ".join(terms) + ";"
+                )
+    if not lines:
+        total = max(1, out_h * out_w * out_c * out_bits)
+        lines.append(f"  assign {name} = {total}'d0;")
+    return lines
+
+
 @lowering("ram_writable")
 def _lower_ram_writable(ctx: EmitContext, g: Gate) -> list[str]:
     """Synchronous-write, asynchronous-read writable RAM.
