@@ -145,10 +145,13 @@ def softmax_block(
           reg signed [{abits-1}:0] x_buf [0:{K-1}];
           reg [{K-1}:0]            mask_buf;
           integer i;
+          // Blocking assignment to x_buf array elements: verilator rejects
+          // NBA to array elements inside for-loops. Single writer, same
+          // semantics here.
           always @(posedge clk) begin
             if (state == STATE_IDLE && start) begin
               for (i = 0; i < {K}; i = i + 1)
-                x_buf[i] <= $signed(x_packed[i*{abits} +: {abits}]);
+                x_buf[i] = $signed(x_packed[i*{abits} +: {abits}]);
               mask_buf <= mask;
             end
           end

@@ -89,10 +89,11 @@ def silu_block(
 
           reg signed [{abits-1}:0] x_buf [0:{K-1}];
           integer i;
+          // Blocking inside for-loop: verilator-friendly array init.
           always @(posedge clk) begin
             if (state == STATE_IDLE && start)
               for (i = 0; i < {K}; i = i + 1)
-                x_buf[i] <= $signed(x_packed[i*{abits} +: {abits}]);
+                x_buf[i] = $signed(x_packed[i*{abits} +: {abits}]);
           end
 
           wire signed [{abits-1}:0] x_now = x_buf[counter];

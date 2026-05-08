@@ -131,10 +131,11 @@ def matmul_streaming_block(
           // ---- Activation buffer (latched on start) ----
           reg signed [{act_bits - 1}:0] x_buf [0:{K - 1}];
           integer ii;
+          // Blocking inside for-loop: verilator-friendly array init.
           always @(posedge clk) begin
             if (state == STATE_IDLE && start)
               for (ii = 0; ii < {K}; ii = ii + 1)
-                x_buf[ii] <= $signed(x_packed[ii*{act_bits} +: {act_bits}]);
+                x_buf[ii] = $signed(x_packed[ii*{act_bits} +: {act_bits}]);
           end
 
           // ---- Weight ROM ----

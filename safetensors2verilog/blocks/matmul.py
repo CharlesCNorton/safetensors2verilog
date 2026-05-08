@@ -274,12 +274,16 @@ def matmul_seq_block(
           assign done = (state == STATE_DONE);
 
           // ---- Activation buffer (latched on start in IDLE) -------------------
+          // Blocking assignment inside the for-loop: verilator rejects NBA
+          // to an array-element inside a for-loop. Each element is written
+          // exactly once per active cycle, so blocking has identical
+          // semantics here.
           reg signed [{act_bits - 1}:0] x_buf [0:{K - 1}];
           integer i;
           always @(posedge clk) begin
             if (state == STATE_IDLE && start) begin
               for (i = 0; i < {K}; i = i + 1) begin
-                x_buf[i] <= $signed(x_packed[i*{act_bits} +: {act_bits}]);
+                x_buf[i] = $signed(x_packed[i*{act_bits} +: {act_bits}]);
               end
             end
           end

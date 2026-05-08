@@ -253,10 +253,11 @@ def attention_step_block(
               cache_r_pos   <= 0;
               softmax_start <= 0;
               mask_buf      <= 0;
+              // Blocking inside for-loops: verilator-friendly array init.
               for (init_i = 0; init_i < {H*D}; init_i = init_i + 1)
-                out_buf[init_i] <= 0;
+                out_buf[init_i] = 0;
               for (init_i = 0; init_i < {D}; init_i = init_i + 1)
-                vout_acc[init_i] <= 0;
+                vout_acc[init_i] = 0;
             end else begin
               cache_we      <= 0;
               softmax_start <= 0;
@@ -306,9 +307,13 @@ def attention_step_block(
                 end
 
                 STATE_SCORE_FINISH: begin
-                  for (init_i = 0; init_i < {max_seq}; init_i = init_i + 1)
-                    mask_buf[init_i] <=
-                      (init_i <= pos_latched) ? 1'b1 : 1'b0;
+                  // Causal mask: bits 0..pos_latched are 1, rest 0.
+                  // Computed as (1 << (pos+1)) - 1, masked to max_seq bits.
+                  // Single NBA so verilator accepts this and the reset
+                  // path's NBA together.
+                  mask_buf <=
+                    (({{{max_seq}{{1'b1}}}} >> ({max_seq} - 1 - pos_latched))
+                     & {{{max_seq}{{1'b1}}}});
                   state <= STATE_SOFTMAX_START;
                 end
 
@@ -322,8 +327,9 @@ def attention_step_block(
                     kpos_idx    <= 0;
                     d_idx       <= 0;
                     cache_r_pos <= 0;
+                    // Blocking inside for-loop: verilator-friendly array reset.
                     for (init_i = 0; init_i < {D}; init_i = init_i + 1)
-                      vout_acc[init_i] <= 0;
+                      vout_acc[init_i] = 0;
                     state <= STATE_VOUT;
                   end
                 end

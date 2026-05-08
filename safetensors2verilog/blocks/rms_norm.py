@@ -177,10 +177,11 @@ def rms_norm_block(
           // ---- Activation buffer (latched on start in IDLE) ----------------
           reg signed [{abits-1}:0] x_buf [0:{K-1}];
           integer i;
+          // Blocking inside for-loop: verilator-friendly array init.
           always @(posedge clk) begin
             if (state == STATE_IDLE && start) begin
               for (i = 0; i < {K}; i = i + 1) begin
-                x_buf[i] <= $signed(x_packed[i*{abits} +: {abits}]);
+                x_buf[i] = $signed(x_packed[i*{abits} +: {abits}]);
               end
             end
           end
