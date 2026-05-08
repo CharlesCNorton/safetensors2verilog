@@ -167,6 +167,12 @@ class OnnxTopologyFrontend(Frontend):
 
         # ---- IR construction ----
         gates: list[Gate] = []
+        # Submodules accumulated by per-element activation ops (Sigmoid, Exp,
+        # ...); each emits an `instance` Gate that references a parameterised
+        # block from ``safetensors2verilog.blocks``. The backend dedups by
+        # module name so multiple identical-shape instances share one
+        # emitted RawSubmodule.
+        _onnx_pending_submodules: list = []
 
         # Maps ONNX value names -> list of IR signal names (one per element)
         # plus the (width, signed) of each.
@@ -487,6 +493,69 @@ class OnnxTopologyFrontend(Frontend):
                 val_widths[outs[0]] = relu_width
                 val_signed[outs[0]] = True
 
+            elif op in ("Sigmoid", "Exp"):
+                # Per-element LUT-based activation. The hardware blocks live
+                # in safetensors2verilog.blocks.{sigmoid,exp} and are
+                # parameterised by (in_bits, out_bits, q_frac_bits). One
+                # instance per element; the backend dedups the module by
+                # shape-canonical name.
+                from ..blocks.sigmoid import sigmoid_block
+                from ..blocks.exp import exp_block
+                if op == "Sigmoid":
+                    sub = sigmoid_block(in_bits=8, out_bits=8,
+                                         in_q_frac_bits=4)
+                else:
+                    sub = exp_block(in_bits=8, out_bits=12,
+                                     in_q_frac_bits=4)
+                # Stash the submodule on a side channel that ``parse``'s
+                # caller consumes (we attach it to a dedicated list on the
+                # graph after the loop; see end of this function).
+                _onnx_pending_submodules.append(sub)
+                in_sigs = val_signals[ins[0]]
+                in_w = val_widths[ins[0]]
+                out_w = 8 if op == "Sigmoid" else 12
+                label = node.name or f"{op.lower()}_{len(gates)}"
+                out_sigs = []
+                for i, sig in enumerate(in_sigs):
+                    if in_w != 8:
+                        # Truncate / sign-extend to 8-bit before LUT lookup.
+                        # (For now require the upstream to emit 8-bit
+                        # signed; signal a clear error otherwise.)
+                        raise NotImplementedError(
+                            f"{op} expects 8-bit signed inputs; "
+                            f"got {in_w}-bit. Insert an explicit requantize."
+                        )
+                    out_name = f"{label}.{i}"
+                    gates.append(Gate(
+                        name=out_name, kind="instance",
+                        inputs=[sig],
+                        attrs={
+                            "module_name": sub.top,
+                            "instance_name": f"{label.replace('.', '_')}_{i}",
+                            "input_ports": ["x"], "output_port": "y",
+                        },
+                        output_width=out_w, output_signed=False,
+                    ))
+                    out_sigs.append(out_name)
+                val_signals[outs[0]] = out_sigs
+                val_widths[outs[0]] = out_w
+                val_signed[outs[0]] = False
+
+            elif op == "Tanh":
+                # tanh(x) = 2*sigmoid(2x) - 1. For first cut, lower to:
+                #   sigmoid_lut over 2x's clamped range, output unsigned 8b,
+                #   then map back to signed via 2*y - 256 (Q1.7 signed).
+                # This is approximate but works for typical activation
+                # ranges. A native tanh LUT is item 3's full deliverable.
+                raise NotImplementedError(
+                    f"ONNX Tanh not yet wired through the LUT path; the "
+                    f"underlying hardware block is straightforward "
+                    f"(mirror of sigmoid_block with tanh contents) but a "
+                    f"dedicated tanh_block hasn't been authored yet. "
+                    f"Workaround: replace Tanh with 2*Sigmoid(2*x)-1 in "
+                    f"the ONNX graph upstream."
+                )
+
             elif op == "Identity":
                 # Pass-through: alias the output name to the input's signals.
                 val_signals[outs[0]] = val_signals[ins[0]]
@@ -505,15 +574,17 @@ class OnnxTopologyFrontend(Frontend):
 
             else:
                 supported = (
-                    "Gemm, MatMul, Add, Sub, Mul, Relu, Identity, Constant, "
-                    "Reshape, Concat, Split, Gather"
+                    "Gemm, MatMul, Add, Sub, Mul, Relu, Sigmoid, Exp, "
+                    "Identity, Constant, Reshape, Concat, Split, Gather"
                 )
                 deferred = (
                     "Conv, ConvTranspose (need 2-D windowed access), "
                     "LayerNorm, GroupNorm, BatchNorm (need fixed-point "
-                    "sqrt/divide), Softmax, Sigmoid, Tanh, Exp (need "
-                    "fixed-point transcendentals), Attention (composite "
-                    "of softmax + matmul)"
+                    "sqrt/divide), Softmax, Tanh (need dedicated LUT "
+                    "blocks; Tanh = 2*Sigmoid(2x)-1 as workaround), "
+                    "Attention (composite of softmax + matmul; the "
+                    "hf_llama frontend in safetensors2verilog.frontends "
+                    "covers transformer attention end-to-end)"
                 )
                 raise NotImplementedError(
                     f"ONNX op '{op}' (node '{node.name}') not supported by "
@@ -543,6 +614,7 @@ class OnnxTopologyFrontend(Frontend):
             outputs=output_signals,
             gates=gates,
             top=top,
+            submodules=list(_onnx_pending_submodules),
         )
 
 

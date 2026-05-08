@@ -106,7 +106,12 @@ def evaluate_graph(
             raise ValueError(
                 f"gate '{g.name}' references undefined signal {e}"
             ) from e
-        values[g.name] = _mask(v, widths[g.name], signed[g.name])
+        # ``None`` represents high-impedance (Z) from a tristate gate;
+        # propagate as-is so downstream sinks see the disconnect.
+        if v is None:
+            values[g.name] = None
+        else:
+            values[g.name] = _mask(v, widths[g.name], signed[g.name])
 
     return values
 
@@ -235,9 +240,14 @@ def _eval_gate(
         return 0
 
     if kind == "tristate":
-        # high-Z is represented as 0 by default for cross-checking;
-        # callers caring about Z should inspect the gate directly.
-        return inps[0] if inps[1] else 0
+        # When the enable signal is asserted, drive the data through.
+        # Otherwise return ``None`` to mark the bus as high-impedance;
+        # downstream consumers must treat ``None`` as "don't read" or
+        # propagate it. (The previous behaviour returned 0 unconditionally,
+        # which silently hid Z propagation bugs in cross-checks.)
+        enable_high = bool(g.attrs.get("enable_high", True))
+        en_active = (inps[1] != 0) if enable_high else (inps[1] == 0)
+        return inps[0] if en_active else None
 
     raise NotImplementedError(
         f"evaluate_graph does not implement kind '{kind}' "

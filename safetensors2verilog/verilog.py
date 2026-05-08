@@ -468,6 +468,47 @@ def _lower_clamp(ctx: EmitContext, g: Gate) -> list[str]:
     ]
 
 
+def _vendor_attr_lines(g: Gate) -> list[str]:
+    """Render vendor placement / floorplan attributes from gate attrs.
+
+    Recognised keys (any can be present, all are optional):
+      vivado_loc      Vivado / Versal: ``(* LOC = "X12Y34" *)``
+      vivado_keep     Vivado: ``(* keep = "true" *)``
+      vivado_dont_touch  Vivado: ``(* DONT_TOUCH = "yes" *)``
+      quartus_chip_pin   Quartus: ``(* chip_pin = "AB12" *)``
+      quartus_loc        Quartus: ``(* altera_attribute = "-name LOCATION ..." *)``
+      lattice_loc        Lattice: ``(* LOC = "X12Y34" *)`` (Diamond/Radiant)
+      synplify_keep      Synplify: ``(* syn_keep = 1 *)``
+      generic_attr       free-form: list of (key, value) pairs that emit as
+                         ``(* key = "value" *)``
+
+    Returns Verilog attribute lines (each with the `(* ... *)` syntax) to
+    place above the Gate's main lowering. Empty list if no vendor attrs
+    are set.
+    """
+    out: list[str] = []
+    a = g.attrs
+    if "vivado_loc" in a:
+        out.append(f'  (* LOC = "{a["vivado_loc"]}" *)')
+    if a.get("vivado_keep"):
+        out.append('  (* keep = "true" *)')
+    if a.get("vivado_dont_touch"):
+        out.append('  (* DONT_TOUCH = "yes" *)')
+    if "quartus_chip_pin" in a:
+        out.append(f'  (* chip_pin = "{a["quartus_chip_pin"]}" *)')
+    if "quartus_loc" in a:
+        out.append(
+            f'  (* altera_attribute = "-name LOCATION {a["quartus_loc"]}" *)'
+        )
+    if "lattice_loc" in a:
+        out.append(f'  (* LOC = "{a["lattice_loc"]}" *)')
+    if a.get("synplify_keep"):
+        out.append('  (* syn_keep = 1 *)')
+    for k, v in a.get("generic_attr", []):
+        out.append(f'  (* {k} = "{v}" *)')
+    return out
+
+
 @lowering("register")
 def _lower_register(ctx: EmitContext, g: Gate) -> list[str]:
     """Synchronous flip-flop.
@@ -482,6 +523,9 @@ def _lower_register(ctx: EmitContext, g: Gate) -> list[str]:
       reset_kind      "async" (default) or "sync"
       enable          enable signal name (optional); takes precedence
                       over the second `inputs` element when both supplied
+      Plus any vendor-attribute keys recognised by ``_vendor_attr_lines``
+      (vivado_loc, vivado_keep, quartus_chip_pin, lattice_loc, etc.) that
+      propagate as ``(* ... *)`` attributes onto the emitted register.
     """
     if len(g.inputs) not in (1, 2):
         raise ValueError(
@@ -517,21 +561,22 @@ def _lower_register(ctx: EmitContext, g: Gate) -> list[str]:
         if en_signal else f"{name} <= {d};"
     )
 
+    vendor = _vendor_attr_lines(g)
     if rst:
         if kind == "async":
-            return [
+            return vendor + [
                 f"  always @(posedge {clk} or {rst_edge}) begin",
                 f"    if ({rst_test}) {name} <= {init_lit};",
                 f"    else {body_assign}",
                 "  end",
             ]
-        return [
+        return vendor + [
             f"  always @(posedge {clk}) begin",
             f"    if ({rst_test}) {name} <= {init_lit};",
             f"    else {body_assign}",
             "  end",
         ]
-    return [f"  always @(posedge {clk}) {body_assign}"]
+    return vendor + [f"  always @(posedge {clk}) {body_assign}"]
 
 
 @lowering("tristate")

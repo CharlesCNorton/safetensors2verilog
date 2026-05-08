@@ -42,6 +42,21 @@ from safetensors import safe_open
 from ..core import Frontend, FrontendOption, Gate, GateGraph, Signal, registry
 
 
+def bitnet_rom_parity_bits(rom_init: list[int]) -> list[int]:
+    """Compute even-parity bits for a list of ROM entries.
+
+    Used by callers that want to detect single-bit flips in BitNet's 2-bit
+    signed weight ROMs. Returns one bit per entry; emit alongside the
+    main ROM, then XOR the read value's bits against the parity bit on
+    each access and raise a ``parity_error`` if it doesn't match.
+
+    Note: this gives single-bit detection, not correction. For correction
+    a SECDED Hamming code over the 2-bit value would need 3 extra bits
+    per entry (5-bit total per weight), which is a higher-area trade.
+    """
+    return [(int(v) & 1) ^ ((int(v) >> 1) & 1) for v in rom_init]
+
+
 def _is_ternary(t: torch.Tensor, atol: float = 1e-6) -> bool:
     if t.dtype.is_floating_point:
         tf = t.to(torch.float64)

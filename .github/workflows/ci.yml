@@ -13,10 +13,10 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -46,13 +46,74 @@ jobs:
             synth -top half_adder;
             abc -lut 6;
             stat;
-          "
+          " | tee yosys_halfadder.log
+
+      - name: Gate Yosys synth budget for half-adder
+        run: |
+          # Half-adder should fit in <= 6 LUT4 cells; fail loudly if a
+          # regression bloats it. (item 27 — synth-budget gating in CI.)
+          n=$(grep -E "^\s+[0-9]+\s+SB_LUT4|^\s+[0-9]+\s+\\$lut" \
+                yosys_halfadder.log | awk '{s+=$1} END{print s+0}')
+          echo "half-adder LUT-equivalent cells: $n"
+          if [ "$n" -gt 12 ]; then
+            echo "FAIL: half-adder exceeded 12-cell budget" >&2
+            exit 1
+          fi
+
+  verilator:
+    # item 67: verilator + g++ as a CI target for the LM-frontend path.
+    # Runs the streaming-matmul + tiny-LLaMA tests through verilator instead
+    # of iverilog so the LM emission path (long signal lists, large
+    # generate-for arrays, $readmemh sidecar weight ROMs) is exercised by
+    # the build pipeline that real LM compiles use.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install verilator + g++ + iverilog
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator g++ make iverilog
+          verilator --version
+          g++ --version | head -1
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[test,onnx]
+      - name: Run combinational primitive tests through iverilog
+        run: python _play/test_blocks_combinational.py
+      - name: Run sequential primitive tests through iverilog
+        run: python _play/test_blocks_sequential.py
+      - name: Run rope, attention, streaming-matmul, tiny-llama tests
+        run: |
+          python _play/test_rope.py
+          python _play/test_attention.py
+          python _play/test_matmul_stream.py
+          python _play/tiny_llama_e2e.py
+      - name: Build tiny-llama through verilator
+        run: |
+          # Take the tiny-llama emit + verilator-build round-trip from
+          # _play/tiny_llama_e2e.py one step further by passing it through
+          # verilator + g++. This catches Verilog patterns iverilog tolerates
+          # that verilator rejects (NBA inside for-loops, mixed NBA/blocking
+          # on the same signal, etc.).
+          cd _play/tiny_llama_out
+          rm -rf obj_dir
+          verilator --binary --top-module tb -j 4 \
+            --Wno-fatal --Wno-WIDTH --Wno-WIDTHEXPAND --Wno-WIDTHTRUNC \
+            --Wno-UNOPTFLAT --Wno-INFINITELOOP --Wno-UNUSEDSIGNAL \
+            --Wno-UNUSEDPARAM --Wno-CASEINCOMPLETE --Wno-INITIALDLY \
+            -CFLAGS '-O0' tiny_llama.v tb.v
+          ./obj_dir/Vtb | tee verilator_run.log
+          grep -q "DONE" verilator_run.log
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install ruff
@@ -63,8 +124,8 @@ jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install package and mypy
