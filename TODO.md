@@ -47,3 +47,38 @@ Recently shipped (not in this list):
 - `mypy --strict` per-module overrides on `core` / `analysis` / `transforms` / `synth` / `evaluate`.
 - `yosys_calibrated_estimate` wrapper in `examples/lut_ff_estimate.py`.
 - 236 unit tests pass; bit-exact iverilog coverage on tanh, conv2d, conv_transpose2d, chunked ROM, fp8 mul, real-world bitnet fixture, and the sequential-bitnet variant combinations including mac_sharing.
+
+## Open
+
+1. Build the verilator simulator binary for the 30-layer SmolLM2 module and drive a real prompt through it, capturing the predicted next token.
+2. Build verilator binaries at 2 and 4 layers and confirm each produces a plausible token for a fixed prompt.
+3. Drive a real prompt through the SmolLM2 1-layer verilator binary and compare its argmax against the transformers fp32 reference, reporting per-position agreement.
+4. Bit-exact iverilog tests for ONNX `Conv` and `ConvTranspose` against `torch.nn.functional.conv2d` and `conv_transpose2d` on a 16-case input sweep.
+5. Bit-exact iverilog test for `fp8_e4m3_mul` against a Python fp16 multiply reference across the full 256x256 (a, b) input space.
+6. Run `emit_vivado_tcl` output through Vivado and check in the resulting utilization + timing reports.
+7. Run `emit_quartus_qsf` output through `quartus_sh -t` and check in the fit + STA reports.
+8. Run `emit_synopsys_dc_tcl` output through `dc_shell` and check in the area + timing reports.
+9. Functional iverilog test for `--handshake` that drives stimulus and confirms the FSM holds DONE until `ready_in` fires.
+10. Functional iverilog test for `--streaming-input` that fills inputs via `valid_in` / `ready_out` and confirms the COMPUTE phase produces the expected outputs.
+11. Functional iverilog test for `--weight-bram` that loads weights via the `weight_addr_*` / `weight_data` / `weight_we` ports and confirms compute matches a reference.
+12. Functional iverilog test for `--parallelism N` that confirms cycle count grows by `ceil(out_size/N)` and outputs match the non-parallelism baseline.
+13. Functional iverilog test for `--mac-sharing` that confirms storage register values match the corresponding accumulator values at end-of-group.
+14. Extend `evaluate_graph` to handle the `ram_writable` write path so `--weight-bram` designs simulate end-to-end in Python.
+15. Calibrate against 32 sequences of 128 tokens from C4 (or WikiText) on full 30-layer SmolLM2 and emit the per-layer JSON.
+16. Run `calibrate_iteratively_damped` on full SmolLM2 with `damping` in {0.3, 0.5, 0.7} and capture the per-site convergence trajectory.
+17. Bit-exact iverilog test of the streaming `lm_head` path at SmolLM2 vocab (49152) against a parallel-matmul reference scaled up from a smaller vocab.
+18. Run nextpnr-ice40 (or nextpnr-ecp5) on at least one full SmolLM2 layer and capture LC / EBR / Fmax.
+19. Run nextpnr-ice40 on a `--mac-sharing` plus `--parallelism` design and report whether the synth pass collapses MAC count.
+20. Bit-exact iverilog test of `conv2d` on a 28x28 input, 5x5 kernel, 3 input channels, 8 output channels against `torch.nn.functional.conv2d`.
+21. Bit-exact iverilog test of `emit_chunked_rom` at SmolLM2 embedding scale (49152 x 576) against a flat ROM golden.
+22. Cross-check `llama_int_reference_one_layer` output against the Verilog the `hf_llama` frontend emits, for a single token, bit by bit.
+23. Add proper RoPE to `llama_fp32_reference_logits_one_layer` so multi-position decode is gold-comparable.
+24. Add a real-data agreement test that asserts at least 50% argmax overlap between the int and fp32 references on the tiny fixture.
+25. Read explicit (H, W) from ONNX `value_info` so non-square Conv / ConvTranspose inputs are accepted.
+26. Add multi-head support to the ONNX `Attention` lowering, with optional mask plus `past_key` / `past_value`.
+27. Bit-exact iverilog test for ONNX `Softmax` against `torch.nn.functional.softmax` on a row of 8 int8 inputs.
+28. Have `--sidecar-layout subdirs` rewrite the `$readmemh` paths in the emitted Verilog to include the subdirectory prefix, so the Verilog is self-contained without manual include-path management.
+29. Have one built-in frontend (e.g., `threshold_logic` with `--circuit` selecting multiple prefixes) override `parse_multi` to return multiple graphs.
+30. Have the `embedding_block` factory call `emit_chunked_rom` when `V * H` exceeds the BRAM threshold, replacing the flat ROM path at scale.
+31. Round-trip `emit_instantiation_template` by compiling a wrapper that consumes the snippet against the original module and confirming both elaborate together.
+32. Add explicit bit-exact iverilog tests for `sigmoid_block`, `silu_block`, `exp_block`, and `softmax_block` (the README's "bit-exact" claim is older than this session and the new tests cover only `tanh_block`).
