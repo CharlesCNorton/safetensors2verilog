@@ -2799,6 +2799,82 @@ def test_pick_chunking_small_rom_no_chunking_needed():
     assert n_row == 1 and n_col == 1
 
 
+def test_emit_chunked_rom_iverilog_at_multi_row_multi_col_scale():
+    """Compile a chunked ROM at non-trivial scale (1024 entries x 36 bits,
+    chunked across multiple row-banks under Xilinx 36 Kbit BRAM sizing)
+    and verify a sample of addresses returns the expected entries.
+
+    A full SmolLM2-scale (49152 x 4608) chunked ROM is too large to
+    elaborate through iverilog in reasonable time; this 1024 x 36 fixture
+    exercises the chunking math at a depth where multiple row-banks fire
+    plus the column-concat path is non-trivial."""
+    import shutil
+    import subprocess
+    if shutil.which("iverilog") is None or shutil.which("vvp") is None:
+        pytest.skip("iverilog/vvp not on PATH")
+    from safetensors2verilog.bram_chunk import (
+        emit_chunked_rom, pick_chunking,
+    )
+
+    depth = 1024
+    width = 36
+    init = [
+        ((i * 0x1f3779b1 + 7) & ((1 << width) - 1))
+        for i in range(depth)
+    ]
+    cd, cb, n_row, n_col = pick_chunking(depth, width)
+    # Confirm we're actually exercising chunking (otherwise the test
+    # collapses to the trivial single-bank case).
+    assert n_row * cd >= depth
+    assert n_col * cb >= width
+    body = emit_chunked_rom(
+        "rom", init, depth=depth, width=width,
+        chunk_depth=cd, chunk_bits=cb, addr_signal="addr",
+    )
+    sample_addrs = [0, 1, 7, 100, 256, 511, 512, 700, 1000, 1023]
+    addr_w = max(1, (depth - 1).bit_length())
+    src = (
+        "`default_nettype none\n"
+        f"module rom_top(input wire [{addr_w-1}:0] addr,\n"
+        f"               output wire [{width-1}:0] dout);\n"
+        f"{body}\n"
+        f"  assign dout = rom;\n"
+        "endmodule\n"
+        "`default_nettype wire\n"
+        "`timescale 1ns/1ps\n"
+        "module tb;\n"
+        f"  reg [{addr_w-1}:0] addr;\n"
+        f"  wire [{width-1}:0] dout;\n"
+        "  rom_top dut(.addr(addr), .dout(dout));\n"
+        "  initial begin\n"
+    )
+    for a in sample_addrs:
+        src += f'    addr = {addr_w}\'d{a}; #1; $display("ADDR %0d %h", addr, dout);\n'
+    src += "    $finish;\n  end\nendmodule\n"
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        v = td / "rom.v"
+        v.write_text(src, encoding="utf-8")
+        vvp = td / "rom.vvp"
+        subprocess.run(
+            ["iverilog", "-g2012", "-o", str(vvp), str(v)],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+        proc = subprocess.run(
+            ["vvp", str(vvp)], check=True, capture_output=True, text=True,
+            timeout=60,
+        )
+    for line in proc.stdout.splitlines():
+        if line.startswith("ADDR"):
+            _, addr_s, hex_s = line.split()
+            a = int(addr_s)
+            got = int(hex_s, 16)
+            assert got == init[a], (
+                f"chunked ROM at addr {a}: got {got:x} expected "
+                f"{init[a]:x} (n_row={n_row}, n_col={n_col})"
+            )
+
+
 def test_emit_chunked_rom_iverilog_bit_exact_4_banks():
     """Compile a chunked ROM through iverilog and verify each address
     returns the expected entry."""
